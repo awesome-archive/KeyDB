@@ -27,6 +27,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "fmacros.h"
 #include "fastlock.h"
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -34,12 +35,22 @@
 #include <sched.h>
 #include <atomic>
 #include <assert.h>
+#ifdef __FreeBSD__
+#include <pthread_np.h>
+#else
 #include <pthread.h>
+#endif
 #include <limits.h>
+#include <map>
 #ifdef __linux__
 #include <linux/futex.h>
+#include <sys/sysinfo.h>
 #endif
 #include <string.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include "config.h"
+#include "serverassert.h"
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -57,6 +68,16 @@
 #define UNUSED(x) ((void)x)
 #endif
 
+#ifdef HAVE_BACKTRACE
+#include <ucontext.h>
+__attribute__((weak)) void logStackTrace(void *, int) {
+    printf("\tFailed to generate stack trace\n");
+}
+#endif
+
+extern int g_fInCrash;
+extern int g_fTestMode;
+int g_fHighCpuPressure = false;
 
 /****************************************************
  *
@@ -68,6 +89,10 @@
 
 #if !defined(__has_feature)
     #define __has_feature(x) 0
+#endif
+
+#ifdef __linux__
+extern "C" void unlock_futex(struct fastlock *lock, uint16_t ifutex);
 #endif
 
 #if __has_feature(thread_sanitizer)
@@ -125,26 +150,19 @@
 
 #endif
 
-static_assert(sizeof(pid_t) <= sizeof(fastlock::m_pidOwner), "fastlock::m_pidOwner not large enough");
-uint64_t g_longwaits = 0;
-
-uint64_t fastlock_getlongwaitcount()
+extern "C"  __attribute__((weak)) void _serverPanic(const char * /*file*/, int /*line*/, const char * /*msg*/, ...)
 {
-    uint64_t rval;
-    __atomic_load(&g_longwaits, &rval, __ATOMIC_RELAXED);
-    return rval;
+    *((char*)-1) = 'x';
 }
 
-#ifndef ASM_SPINLOCK
-#ifdef __linux__
-static int futex(volatile unsigned *uaddr, int futex_op, int val,
-    const struct timespec *timeout, int val3)
+__attribute__((weak)) void serverLog(int , const char *fmt, ...)
 {
-    return syscall(SYS_futex, uaddr, futex_op, val,
-                    timeout, uaddr, val3);
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+    printf("\n");
 }
-#endif
-#endif
 
 extern "C" pid_t gettid()
 {
@@ -155,26 +173,176 @@ extern "C" pid_t gettid()
 #else
 	if (pidCache == -1) {
 		uint64_t tidT;
+#ifdef __FreeBSD__
+// Check https://github.com/ClickHouse/ClickHouse/commit/8d51824ddcb604b6f179a0216f0d32ba5612bd2e
+                tidT = pthread_getthreadid_np();
+#else
 		pthread_threadid_np(nullptr, &tidT);
-		assert(tidT < UINT_MAX);
+#endif
+		serverAssert(tidT < UINT_MAX);
 		pidCache = (int)tidT;
 	}
 #endif
     return pidCache;
 }
 
-extern "C" void fastlock_init(struct fastlock *lock)
+void printTrace()
+{
+#ifdef HAVE_BACKTRACE
+    serverLog(3 /*LL_WARNING*/, "printing backtrace for thread %d", gettid());
+    logStackTrace(nullptr, 1);
+#endif
+}
+
+
+#ifdef __linux__
+static int futex(volatile unsigned *uaddr, int futex_op, int val,
+    const struct timespec *timeout, int val3)
+{
+    return syscall(SYS_futex, uaddr, futex_op, val,
+                    timeout, uaddr, val3);
+}
+#endif
+
+class DeadlockDetector
+{
+    fastlock m_lock { "deadlock detector" };    // destruct this first
+    std::map<pid_t, fastlock *> m_mapwait;
+
+public:
+    void registerwait(fastlock *lock, pid_t thispid)
+    {
+        static volatile bool fInDeadlock = false;
+
+        if (lock == &m_lock || g_fInCrash)
+            return;
+        fastlock_lock(&m_lock);
+        
+        if (fInDeadlock)
+        {
+            printTrace();
+            fastlock_unlock(&m_lock);
+            return;
+        }
+
+        m_mapwait.insert(std::make_pair(thispid, lock));
+
+        // Detect cycles
+        pid_t pidCheck = thispid;
+        size_t cchecks = 0;
+        for (;;)
+        {
+            auto itr = m_mapwait.find(pidCheck);
+            if (itr == m_mapwait.end())
+                break;
+
+            __atomic_load(&itr->second->m_pidOwner, &pidCheck, __ATOMIC_RELAXED);
+            if (pidCheck == thispid)
+            {
+                // Deadlock detected, printout some debugging info and crash
+                serverLog(3 /*LL_WARNING*/, "\n\n");
+                serverLog(3 /*LL_WARNING*/, "!!! ERROR: Deadlock detected !!!");
+                pidCheck = thispid;
+                for (;;)
+                {
+                    auto itr = m_mapwait.find(pidCheck);
+                    serverLog(3 /* LL_WARNING */, "\t%d: (%p) %s", pidCheck, itr->second, itr->second->szName);
+                    __atomic_load(&itr->second->m_pidOwner, &pidCheck, __ATOMIC_RELAXED);
+                    if (pidCheck == thispid)
+                        break;
+                }
+                // Wake All sleeping threads so they can print their callstacks
+#ifdef HAVE_BACKTRACE
+#ifdef __linux__
+                int mask = -1;
+                fInDeadlock = true;
+                fastlock_unlock(&m_lock);
+                futex(&lock->m_ticket.u, FUTEX_WAKE_BITSET_PRIVATE, INT_MAX, nullptr, mask);
+                futex(&itr->second->m_ticket.u, FUTEX_WAKE_BITSET_PRIVATE, INT_MAX, nullptr, mask);
+                sleep(2);
+                fastlock_lock(&m_lock);
+                printTrace();
+#endif
+#endif
+                serverLog(3 /*LL_WARNING*/, "!!! KeyDB Will Now Crash !!!");
+                _serverPanic(__FILE__, __LINE__, "Deadlock detected");
+            }
+
+            if (cchecks > m_mapwait.size())
+                break;  // There is a cycle but we're not in it
+            ++cchecks;
+        }
+        fastlock_unlock(&m_lock);
+    }
+
+    void clearwait(fastlock *lock, pid_t thispid)
+    {
+        if (lock == &m_lock || g_fInCrash)
+            return;
+        fastlock_lock(&m_lock);
+        m_mapwait.erase(thispid);
+        fastlock_unlock(&m_lock);
+    }
+};
+
+DeadlockDetector g_dlock;
+
+static_assert(sizeof(pid_t) <= sizeof(fastlock::m_pidOwner), "fastlock::m_pidOwner not large enough");
+uint64_t g_longwaits = 0;
+
+extern "C" void fastlock_panic(struct fastlock *lock)
+{
+    _serverPanic(__FILE__, __LINE__, "fastlock lock/unlock mismatch for: %s", lock->szName);
+}
+
+uint64_t fastlock_getlongwaitcount()
+{
+    uint64_t rval;
+    __atomic_load(&g_longwaits, &rval, __ATOMIC_RELAXED);
+    return rval;
+}
+
+extern "C" void fastlock_sleep(fastlock *lock, pid_t pid, unsigned wake, unsigned myticket)
+{
+    UNUSED(lock);
+    UNUSED(pid);
+    UNUSED(wake);
+    UNUSED(myticket);
+#ifdef __linux__
+    g_dlock.registerwait(lock, pid);
+    unsigned mask = (1U << (myticket % 32));
+    __atomic_fetch_or(&lock->futex, mask, __ATOMIC_ACQUIRE);
+
+    // double check the lock wasn't release between the last check and us setting the futex mask
+    uint32_t u;
+    __atomic_load(&lock->m_ticket.u, &u, __ATOMIC_ACQUIRE);
+    if ((u & 0xffff) != myticket)
+    {
+        futex(&lock->m_ticket.u, FUTEX_WAIT_BITSET_PRIVATE, wake, nullptr, mask);
+    }
+    
+    __atomic_fetch_and(&lock->futex, ~mask, __ATOMIC_RELEASE);
+    g_dlock.clearwait(lock, pid);
+#endif
+    __atomic_fetch_add(&g_longwaits, 1, __ATOMIC_RELAXED);
+}
+
+extern "C" void fastlock_init(struct fastlock *lock, const char *name)
 {
     lock->m_ticket.m_active = 0;
     lock->m_ticket.m_avail = 0;
     lock->m_depth = 0;
     lock->m_pidOwner = -1;
     lock->futex = 0;
+    int cch = strlen(name);
+    cch = std::min<int>(cch, sizeof(lock->szName)-1);
+    memcpy(lock->szName, name, cch);
+    lock->szName[cch] = '\0';
     ANNOTATE_RWLOCK_CREATE(lock);
 }
 
 #ifndef ASM_SPINLOCK
-extern "C" void fastlock_lock(struct fastlock *lock)
+extern "C" void fastlock_lock(struct fastlock *lock, spin_worker worker)
 {
     int pidOwner;
     __atomic_load(&lock->m_pidOwner, &pidOwner, __ATOMIC_ACQUIRE);
@@ -184,34 +352,44 @@ extern "C" void fastlock_lock(struct fastlock *lock)
         return;
     }
 
+    int tid = gettid();
     unsigned myticket = __atomic_fetch_add(&lock->m_ticket.m_avail, 1, __ATOMIC_RELEASE);
-#ifdef __linux__
-    unsigned mask = (1U << (myticket % 32));
-#endif
-    int cloops = 0;
+    unsigned cloops = 0;
     ticket ticketT;
-    for (;;)
-    {
-        __atomic_load(&lock->m_ticket.u, &ticketT.u, __ATOMIC_ACQUIRE);
-        if ((ticketT.u & 0xffff) == myticket)
-            break;
+    int fHighPressure;
+    __atomic_load(&g_fHighCpuPressure, &fHighPressure, __ATOMIC_RELAXED);
+    unsigned loopLimit = fHighPressure ? 0x10000 : 0x100000;
+
+    if (worker != nullptr) {
+        for (;;) {
+            __atomic_load(&lock->m_ticket.u, &ticketT.u, __ATOMIC_ACQUIRE);
+            if ((ticketT.u & 0xffff) == myticket)
+                break;
+            if (!worker())
+                goto LNormalLoop;
+        }
+    } else {
+LNormalLoop:
+        for (;;)
+        {
+            __atomic_load(&lock->m_ticket.u, &ticketT.u, __ATOMIC_ACQUIRE);
+            if ((ticketT.u & 0xffff) == myticket)
+                break;
 
 #if defined(__i386__) || defined(__amd64__)
-        __asm__ ("pause");
+            __asm__ __volatile__ ("pause");
+#elif defined(__aarch64__)
+            __asm__ __volatile__ ("yield");
 #endif
-        if ((++cloops % 1024*1024) == 0)
-        {
-#ifdef __linux__
-            __atomic_fetch_or(&lock->futex, mask, __ATOMIC_ACQUIRE);
-            futex(&lock->m_ticket.u, FUTEX_WAIT_BITSET_PRIVATE, ticketT.u, nullptr, mask);
-            __atomic_fetch_and(&lock->futex, ~mask, __ATOMIC_RELEASE);
-#endif
-            __atomic_fetch_add(&g_longwaits, 1, __ATOMIC_RELAXED);
+
+            if ((++cloops % loopLimit) == 0)
+            {
+                fastlock_sleep(lock, tid, ticketT.u, myticket);
+            }
         }
     }
 
     lock->m_depth = 1;
-    int tid = gettid();
     __atomic_store(&lock->m_pidOwner, &tid, __ATOMIC_RELEASE);
     ANNOTATE_RWLOCK_ACQUIRED(lock, true);
     std::atomic_thread_fence(std::memory_order_acquire);
@@ -238,7 +416,7 @@ extern "C" int fastlock_trylock(struct fastlock *lock, int fWeak)
 
     struct ticket ticket_expect { { { active, active } } };
     struct ticket ticket_setiflocked { { { active, next } } };
-    if (__atomic_compare_exchange(&lock->m_ticket, &ticket_expect, &ticket_setiflocked, fWeak /*weak*/, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+    if (__atomic_compare_exchange(&lock->m_ticket.u, &ticket_expect.u, &ticket_setiflocked.u, fWeak /*weak*/, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
     {
         lock->m_depth = 1;
         tid = gettid();
@@ -249,31 +427,6 @@ extern "C" int fastlock_trylock(struct fastlock *lock, int fWeak)
     return false;
 }
 
-#ifdef __linux__
-#define ROL32(v, shift) ((v << shift) | (v >> (32-shift)))
-void unlock_futex(struct fastlock *lock, uint16_t ifutex)
-{
-    unsigned mask = (1U << (ifutex % 32));
-    unsigned futexT;
-    __atomic_load(&lock->futex, &futexT, __ATOMIC_RELAXED);
-    futexT &= mask;
-    
-    if (futexT == 0)
-        return;
-    
-    for (;;)
-    {
-        __atomic_load(&lock->futex, &futexT, __ATOMIC_ACQUIRE);
-        futexT &= mask;
-        if (!futexT)
-            break;
-
-        if (futex(&lock->m_ticket.u, FUTEX_WAKE_BITSET_PRIVATE, INT_MAX, nullptr, mask) == 1)
-            break;
-    }
-}
-#endif
-
 extern "C" void fastlock_unlock(struct fastlock *lock)
 {
     --lock->m_depth;
@@ -281,7 +434,7 @@ extern "C" void fastlock_unlock(struct fastlock *lock)
     {
         int pidT;
         __atomic_load(&lock->m_pidOwner, &pidT, __ATOMIC_RELAXED);
-        assert(pidT >= 0);  // unlock after free
+        serverAssert(pidT >= 0);  // unlock after free
         int t = -1;
         __atomic_store(&lock->m_pidOwner, &t, __ATOMIC_RELEASE);
         std::atomic_thread_fence(std::memory_order_release);
@@ -296,11 +449,32 @@ extern "C" void fastlock_unlock(struct fastlock *lock)
 }
 #endif
 
+#ifdef __linux__
+#define ROL32(v, shift) ((v << shift) | (v >> (32-shift)))
+extern "C" void unlock_futex(struct fastlock *lock, uint16_t ifutex)
+{
+    unsigned mask = (1U << (ifutex % 32));
+    unsigned futexT;
+    
+    for (;;)
+    {
+        __atomic_load(&lock->futex, &futexT, __ATOMIC_ACQUIRE);
+        futexT &= mask;
+        if (!futexT)
+            break;
+
+        if (futex(&lock->m_ticket.u, FUTEX_WAKE_BITSET_PRIVATE, INT_MAX, nullptr, mask) == 1)
+            break;
+    }
+}
+#endif
+
 extern "C" void fastlock_free(struct fastlock *lock)
 {
     // NOP
-    assert((lock->m_ticket.m_active == lock->m_ticket.m_avail)                                        // Asser the lock is unlocked
-        || (lock->m_pidOwner == gettid() && (lock->m_ticket.m_active == lock->m_ticket.m_avail-1)));  // OR we own the lock and nobody else is waiting
+    serverAssert((lock->m_ticket.m_active == lock->m_ticket.m_avail)                             // Assert the lock is unlocked
+        || (lock->m_pidOwner == gettid() 
+            && (lock->m_ticket.m_active == static_cast<uint16_t>(lock->m_ticket.m_avail-1U))));  // OR we own the lock and nobody else is waiting
     lock->m_pidOwner = -2;  // sentinal value indicating free
     ANNOTATE_RWLOCK_DESTROY(lock);
 }
@@ -325,4 +499,28 @@ void fastlock_lock_recursive(struct fastlock *lock, int nesting)
 {
     fastlock_lock(lock);
     lock->m_depth = nesting;
+}
+
+void fastlock_auto_adjust_waits()
+{
+#ifdef __linux__
+    struct sysinfo sysinf;
+    int fHighPressurePrev, fHighPressureNew;
+    __atomic_load(&g_fHighCpuPressure, &fHighPressurePrev, __ATOMIC_RELAXED);
+    fHighPressureNew = fHighPressurePrev;
+    memset(&sysinf, 0, sizeof sysinf);
+    if (!sysinfo(&sysinf)) {
+        auto avgCoreLoad = sysinf.loads[0] / get_nprocs();
+        int fHighPressureNew = (avgCoreLoad > ((1 << SI_LOAD_SHIFT) * 0.9));
+        __atomic_store(&g_fHighCpuPressure, &fHighPressureNew, __ATOMIC_RELEASE);
+        if (fHighPressureNew)
+            serverLog(!fHighPressurePrev ?  3 /*LL_WARNING*/ : 1 /* LL_VERBOSE */, "NOTICE: Detuning locks due to high load per core: %.2f%%", avgCoreLoad / (double)(1 << SI_LOAD_SHIFT)*100.0);
+    }
+
+    if (!fHighPressureNew && fHighPressurePrev) {
+        serverLog(3 /*LL_WARNING*/, "NOTICE: CPU pressure reduced");
+    }
+#else
+    g_fHighCpuPressure = g_fTestMode;
+#endif
 }

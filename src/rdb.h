@@ -45,7 +45,7 @@
  * the first byte to interpreter the length:
  *
  * 00|XXXXXX => if the two MSB are 00 the len is the 6 bits of this byte
- * 01|XXXXXX XXXXXXXX =>  01, the len is 14 byes, 6 bits + 8 bits of next byte
+ * 01|XXXXXX XXXXXXXX =>  01, the len is 14 bits, 6 bits + 8 bits of next byte
  * 10|000000 [32 bit integer] => A full 32 bit len in net byte order will follow
  * 10|000001 [64 bit integer] => A full 64 bit len in net byte order will follow
  * 11|OBKIND this means: specially encoded object will follow. The six bits
@@ -91,10 +91,13 @@
 #define RDB_TYPE_HASH_ZIPLIST  13
 #define RDB_TYPE_LIST_QUICKLIST 14
 #define RDB_TYPE_STREAM_LISTPACKS 15
+
+/* KeyDB Specific Object Types */
+#define RDB_TYPE_CRON 64
 /* NOTE: WHEN ADDING NEW RDB TYPE, UPDATE rdbIsObjectType() BELOW */
 
 /* Test if a type is an object type. */
-#define rdbIsObjectType(t) ((t >= 0 && t <= 7) || (t >= 9 && t <= 15))
+#define rdbIsObjectType(t) ((t >= 0 && t <= 7) || (t >= 9 && t <= 15) || (t == RDB_TYPE_CRON))
 
 /* Special RDB opcodes (saved/loaded with rdbSaveType/rdbLoadType). */
 #define RDB_OPCODE_MODULE_AUX 247   /* Module auxiliary data. */
@@ -121,8 +124,16 @@
 #define RDB_LOAD_PLAIN  (1<<1)
 #define RDB_LOAD_SDS    (1<<2)
 
-#define RDB_SAVE_NONE 0
-#define RDB_SAVE_AOF_PREAMBLE (1<<0)
+/* flags on the purpose of rdb save or load */
+#define RDBFLAGS_NONE 0                 /* No special RDB loading. */
+#define RDBFLAGS_AOF_PREAMBLE (1<<0)    /* Load/save the RDB as AOF preamble. */
+#define RDBFLAGS_REPLICATION (1<<1)     /* Load/save for SYNC. */
+#define RDBFLAGS_ALLOW_DUP (1<<2)       /* Allow duplicated keys when loading.*/
+
+/* When rdbLoadObject() returns NULL, the err flag is
+ * set to hold the type of error that occurred */
+#define RDB_LOAD_ERR_EMPTY_KEY  1   /* Error of empty key */
+#define RDB_LOAD_ERR_OTHER      2   /* Any other errors */
 
 int rdbSaveType(rio *rdb, unsigned char type);
 int rdbLoadType(rio *rdb);
@@ -135,21 +146,23 @@ uint64_t rdbLoadLen(rio *rdb, int *isencoded);
 int rdbLoadLenByRef(rio *rdb, int *isencoded, uint64_t *lenptr);
 int rdbSaveObjectType(rio *rdb, robj_roptr o);
 int rdbLoadObjectType(rio *rdb);
-int rdbLoad(rdbSaveInfo *rsi);
-int rdbLoadFile(const char *filename, rdbSaveInfo *rsi);
+int rdbLoad(rdbSaveInfo *rsi, int rdbflags);
+int rdbLoadFile(const char *filename, rdbSaveInfo *rsi, int rdbflags);
 int rdbSaveBackground(rdbSaveInfo *rsi);
 int rdbSaveToSlavesSockets(rdbSaveInfo *rsi);
-void rdbRemoveTempFile(pid_t childpid);
+void rdbRemoveTempFile(pid_t childpid, int from_signal);
 int rdbSave(rdbSaveInfo *rsi);
 int rdbSaveFile(char *filename, rdbSaveInfo *rsi);
 int rdbSaveFp(FILE *pf, rdbSaveInfo *rsi);
 int rdbSaveS3(char *path, rdbSaveInfo *rsi);
-int rdbLoadS3(char *path, rdbSaveInfo *rsi);
+int rdbLoadS3(char *path, rdbSaveInfo *rsi, int rdbflags);
 ssize_t rdbSaveObject(rio *rdb, robj_roptr o, robj *key);
-size_t rdbSavedObjectLen(robj *o);
-robj *rdbLoadObject(int type, rio *rdb, robj *key, uint64_t mvcc_tstamp);
+size_t rdbSavedObjectLen(robj *o, robj *key);
+robj *rdbLoadObject(int type, rio *rdb, sds key, int *error, uint64_t mvcc_tstamp);
 void backgroundSaveDoneHandler(int exitcode, int bysignal);
 int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime);
+ssize_t rdbSaveSingleModuleAux(rio *rdb, int when, moduleType *mt);
+robj *rdbLoadCheckModuleValue(rio *rdb, char *modulename);
 robj *rdbLoadStringObject(rio *rdb);
 ssize_t rdbSaveStringObject(rio *rdb, robj_roptr obj);
 ssize_t rdbSaveRawString(rio *rdb, const unsigned char *s, size_t len);
@@ -158,7 +171,8 @@ int rdbSaveBinaryDoubleValue(rio *rdb, double val);
 int rdbLoadBinaryDoubleValue(rio *rdb, double *val);
 int rdbSaveBinaryFloatValue(rio *rdb, float val);
 int rdbLoadBinaryFloatValue(rio *rdb, float *val);
-int rdbLoadRio(rio *rdb, rdbSaveInfo *rsi, int loading_aof);
+int rdbLoadRio(rio *rdb, int rdbflags, rdbSaveInfo *rsi);
+int rdbSaveRio(rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi);
 rdbSaveInfo *rdbPopulateSaveInfo(rdbSaveInfo *rsi);
 
 #endif

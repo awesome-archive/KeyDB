@@ -30,6 +30,10 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "ae.h"
+#include "anet.h"
+#include "fastlock.h"
+
 #include <condition_variable>
 #include <atomic>
 #include <mutex>
@@ -48,6 +52,8 @@
 #include "fastlock.h"
 #include "zmalloc.h"
 #include "config.h"
+#include "serverassert.h"
+#include "readwritelock.h"
 
 #ifdef USE_MUTEX
 thread_local int cOwnLock = 0;
@@ -80,11 +86,10 @@ public:
 mutex_wrapper g_lock;
 
 #else
-fastlock g_lock;
+fastlock g_lock("AE (global)");
 #endif
+readWriteLock g_forkLock("Fork (global)");
 thread_local aeEventLoop *g_eventLoopThisThread = NULL;
-
-#define AE_ASSERT(x) if (!(x)) do { fprintf(stderr, "AE_ASSER FAILURE\n"); *((volatile int*)0) = 1; } while(0)
 
 /* Include the best multiplexing layer supported by this system.
  * The following should be ordered by performances, descending. */
@@ -110,25 +115,18 @@ enum class AE_ASYNC_OP
     CreateFileEvent,
 };
 
-struct aeCommandControl
-{
-    std::condition_variable cv;
-    std::atomic<int> rval;
-    std::mutex mutexcv;
-};
-
 struct aeCommand
 {
     AE_ASYNC_OP op;
     int fd; 
     int mask;
+    bool fLock = true;
     union {
         aePostFunctionProc *proc;
         aeFileProc *fproc;
         std::function<void()> *pfn;
     };
     void *clientData;
-    aeCommandControl *pctl;
 };
 
 void aeProcessCmd(aeEventLoop *eventLoop, int fd, void *, int )
@@ -139,7 +137,7 @@ void aeProcessCmd(aeEventLoop *eventLoop, int fd, void *, int )
         auto cb = read(fd, &cmd, sizeof(aeCommand));
         if (cb != sizeof(cmd))
         {
-            AE_ASSERT(errno == EAGAIN);
+            serverAssert(errno == EAGAIN);
             break;
         }
         switch (cmd.op)
@@ -149,41 +147,31 @@ void aeProcessCmd(aeEventLoop *eventLoop, int fd, void *, int )
             break;
 
         case AE_ASYNC_OP::CreateFileEvent:
-        {
-            if (cmd.pctl != nullptr)
-            {
-                cmd.pctl->mutexcv.lock();
-                std::atomic_store(&cmd.pctl->rval, aeCreateFileEvent(eventLoop, cmd.fd, cmd.mask, cmd.fproc, cmd.clientData));
-                cmd.pctl->cv.notify_all();
-                cmd.pctl->mutexcv.unlock();
-            }
-            else
-            {
-                aeCreateFileEvent(eventLoop, cmd.fd, cmd.mask, cmd.fproc, cmd.clientData);
-            }
-        }
+            aeCreateFileEvent(eventLoop, cmd.fd, cmd.mask, cmd.fproc, cmd.clientData);
             break;
 
         case AE_ASYNC_OP::PostFunction:
             {
-            std::unique_lock<decltype(g_lock)> ulock(g_lock);
+            std::unique_lock<decltype(g_lock)> ulock(g_lock, std::defer_lock);
+            if (cmd.fLock) {
+                g_forkLock.releaseRead();
+                ulock.lock();
+                g_forkLock.acquireRead();
+            }
             ((aePostFunctionProc*)cmd.proc)(cmd.clientData);
             break;
             }
 
         case AE_ASYNC_OP::PostCppFunction:
         {
-            if (cmd.pctl != nullptr)
-                cmd.pctl->mutexcv.lock();
-            
-            std::unique_lock<decltype(g_lock)> ulock(g_lock);
-            (*cmd.pfn)();
-            
-            if (cmd.pctl != nullptr)
-            {
-                cmd.pctl->cv.notify_all();
-                cmd.pctl->mutexcv.unlock();
+            std::unique_lock<decltype(g_lock)> ulock(g_lock, std::defer_lock);
+            if (cmd.fLock) {
+                g_forkLock.releaseRead();
+                ulock.lock();
+                g_forkLock.acquireRead();
             }
+            (*cmd.pfn)();
+
             delete cmd.pfn;
         }
             break;
@@ -222,39 +210,27 @@ ssize_t safe_write(int fd, const void *pv, size_t cb)
 }
 
 int aeCreateRemoteFileEvent(aeEventLoop *eventLoop, int fd, int mask,
-        aeFileProc *proc, void *clientData, int fSynchronous)
+        aeFileProc *proc, void *clientData)
 {
     if (eventLoop == g_eventLoopThisThread)
         return aeCreateFileEvent(eventLoop, fd, mask, proc, clientData);
 
     int ret = AE_OK;
     
-    aeCommand cmd = {};
+    aeCommand cmd;
     cmd.op = AE_ASYNC_OP::CreateFileEvent;
     cmd.fd = fd;
     cmd.mask = mask;
     cmd.fproc = proc;
     cmd.clientData = clientData;
-    cmd.pctl = nullptr;
-    if (fSynchronous)
-        cmd.pctl = new (MALLOC_LOCAL) aeCommandControl();
+    cmd.fLock = true;
 
-    std::unique_lock<std::mutex> ulock(cmd.pctl->mutexcv, std::defer_lock);
-    if (fSynchronous)
-        cmd.pctl->mutexcv.lock();
     auto size = safe_write(eventLoop->fdCmdWrite, &cmd, sizeof(cmd));
     if (size != sizeof(cmd))
     {
-        AE_ASSERT(size == sizeof(cmd) || size <= 0);
-        AE_ASSERT(errno == EAGAIN);
+        serverAssert(size == sizeof(cmd) || size <= 0);
+        serverAssert(errno == EAGAIN);
         ret = AE_ERR;
-    }
-    
-    if (fSynchronous)
-    {
-        cmd.pctl->cv.wait(ulock);
-        ret = cmd.pctl->rval;
-        delete cmd.pctl;
     }
 
     return ret;
@@ -271,14 +247,16 @@ int aePostFunction(aeEventLoop *eventLoop, aePostFunctionProc *proc, void *arg)
     cmd.op = AE_ASYNC_OP::PostFunction;
     cmd.proc = proc;
     cmd.clientData = arg;
+    cmd.fLock = true;
     auto size = write(eventLoop->fdCmdWrite, &cmd, sizeof(cmd));
-    AE_ASSERT(size == sizeof(cmd));
+    if (size != sizeof(cmd))
+        return AE_ERR;
     return AE_OK;
 }
 
-int aePostFunction(aeEventLoop *eventLoop, std::function<void()> fn, bool fSynchronous)
+int aePostFunction(aeEventLoop *eventLoop, std::function<void()> fn, bool fLock, bool fForceQueue)
 {
-    if (eventLoop == g_eventLoopThisThread)
+    if (eventLoop == g_eventLoopThisThread && !fForceQueue)
     {
         fn();
         return AE_OK;
@@ -287,53 +265,51 @@ int aePostFunction(aeEventLoop *eventLoop, std::function<void()> fn, bool fSynch
     aeCommand cmd = {};
     cmd.op = AE_ASYNC_OP::PostCppFunction;
     cmd.pfn = new (MALLOC_LOCAL) std::function<void()>(fn);
-    cmd.pctl = nullptr;
-    if (fSynchronous)
-        cmd.pctl = new (MALLOC_LOCAL) aeCommandControl();
-    std::unique_lock<std::mutex> ulock(cmd.pctl->mutexcv, std::defer_lock);
-    if (fSynchronous)
-        cmd.pctl->mutexcv.lock();
+    cmd.fLock = fLock;
+
     auto size = write(eventLoop->fdCmdWrite, &cmd, sizeof(cmd));
-    AE_ASSERT(size == sizeof(cmd));
-    int ret = AE_OK;
-    if (fSynchronous)
-    {
-        cmd.pctl->cv.wait(ulock);
-        ret = cmd.pctl->rval;
-        delete cmd.pctl;
+    if (!(!size || size == sizeof(cmd))) {
+        printf("Last error: %d\n", errno);
     }
-    return ret;
+    serverAssert(!size || size == sizeof(cmd));
+
+    if (size == 0)
+        return AE_ERR;
+
+    return AE_OK;
 }
 
 aeEventLoop *aeCreateEventLoop(int setsize) {
     aeEventLoop *eventLoop;
     int i;
 
+    monotonicInit();    /* just in case the calling app didn't initialize */
+    
     if ((eventLoop = (aeEventLoop*)zmalloc(sizeof(*eventLoop), MALLOC_LOCAL)) == NULL) goto err;
     eventLoop->events = (aeFileEvent*)zmalloc(sizeof(aeFileEvent)*setsize, MALLOC_LOCAL);
     eventLoop->fired = (aeFiredEvent*)zmalloc(sizeof(aeFiredEvent)*setsize, MALLOC_LOCAL);
     if (eventLoop->events == NULL || eventLoop->fired == NULL) goto err;
     eventLoop->setsize = setsize;
-    eventLoop->lastTime = time(NULL);
     eventLoop->timeEventHead = NULL;
     eventLoop->timeEventNextId = 0;
     eventLoop->stop = 0;
     eventLoop->maxfd = -1;
     eventLoop->beforesleep = NULL;
     eventLoop->aftersleep = NULL;
+    eventLoop->flags = 0;
     if (aeApiCreate(eventLoop) == -1) goto err;
     /* Events with mask == AE_NONE are not set. So let's initialize the
      * vector with it. */
     for (i = 0; i < setsize; i++)
         eventLoop->events[i].mask = AE_NONE;
 
-    fastlock_init(&eventLoop->flock);
+    fastlock_init(&eventLoop->flock, "event loop");
     int rgfd[2];
     if (pipe(rgfd) < 0)
         goto err;
     eventLoop->fdCmdRead = rgfd[0];
     eventLoop->fdCmdWrite = rgfd[1];
-    fcntl(eventLoop->fdCmdWrite, F_SETFL, O_NONBLOCK);
+    //fcntl(eventLoop->fdCmdWrite, F_SETFL, O_NONBLOCK);
     fcntl(eventLoop->fdCmdRead, F_SETFL, O_NONBLOCK);
     eventLoop->cevents = 0;
     aeCreateFileEvent(eventLoop, eventLoop->fdCmdRead, AE_READABLE|AE_READ_THREADSAFE, aeProcessCmd, NULL);
@@ -354,6 +330,19 @@ int aeGetSetSize(aeEventLoop *eventLoop) {
     return eventLoop->setsize;
 }
 
+/* Return the current EventLoop. */
+aeEventLoop *aeGetCurrentEventLoop(){
+    return g_eventLoopThisThread;
+}
+
+/* Tells the next iteration/s of the event processing to set timeout of 0. */
+void aeSetDontWait(aeEventLoop *eventLoop, int noWait) {
+    if (noWait)
+        eventLoop->flags |= AE_DONT_WAIT;
+    else
+        eventLoop->flags &= ~AE_DONT_WAIT;
+}
+
 /* Resize the maximum set size of the event loop.
  * If the requested set size is smaller than the current set size, but
  * there is already a file descriptor in use that is >= the requested
@@ -362,7 +351,7 @@ int aeGetSetSize(aeEventLoop *eventLoop) {
  *
  * Otherwise AE_OK is returned and the operation is successful. */
 int aeResizeSetSize(aeEventLoop *eventLoop, int setsize) {
-    AE_ASSERT(g_eventLoopThisThread == NULL || g_eventLoopThisThread == eventLoop);
+    serverAssert(g_eventLoopThisThread == NULL || g_eventLoopThisThread == eventLoop);
     int i;
 
     if (setsize == eventLoop->setsize) return AE_OK;
@@ -384,21 +373,30 @@ extern "C" void aeDeleteEventLoop(aeEventLoop *eventLoop) {
     aeApiFree(eventLoop);
     zfree(eventLoop->events);
     zfree(eventLoop->fired);
-    zfree(eventLoop);
     fastlock_free(&eventLoop->flock);
     close(eventLoop->fdCmdRead);
     close(eventLoop->fdCmdWrite);
+
+    /* Free the time events list. */
+    auto *te = eventLoop->timeEventHead;
+    while (te)
+    {
+        auto *teNext = te->next;
+        zfree(te);
+        te = teNext;
+    }
+    zfree(eventLoop);
 }
 
 extern "C" void aeStop(aeEventLoop *eventLoop) {
-    AE_ASSERT(g_eventLoopThisThread == NULL || g_eventLoopThisThread == eventLoop);
+    serverAssert(g_eventLoopThisThread == NULL || g_eventLoopThisThread == eventLoop);
     eventLoop->stop = 1;
 }
 
 extern "C" int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
         aeFileProc *proc, void *clientData)
 {
-    AE_ASSERT(g_eventLoopThisThread == NULL || g_eventLoopThisThread == eventLoop);
+    serverAssert(g_eventLoopThisThread == NULL || g_eventLoopThisThread == eventLoop);
     if (fd >= eventLoop->setsize) {
         errno = ERANGE;
         return AE_ERR;
@@ -421,17 +419,18 @@ void aeDeleteFileEventAsync(aeEventLoop *eventLoop, int fd, int mask)
 {
     if (eventLoop == g_eventLoopThisThread)
         return aeDeleteFileEvent(eventLoop, fd, mask);
-    aeCommand cmd;
+    aeCommand cmd = {};
     cmd.op = AE_ASYNC_OP::DeleteFileEvent;
     cmd.fd = fd;
     cmd.mask = mask;
+    cmd.fLock = true;
     auto cb = write(eventLoop->fdCmdWrite, &cmd, sizeof(cmd));
-    AE_ASSERT(cb == sizeof(cmd));
+    serverAssert(cb == sizeof(cmd));
 }
 
 extern "C" void aeDeleteFileEvent(aeEventLoop *eventLoop, int fd, int mask)
 {
-    AE_ASSERT(g_eventLoopThisThread == NULL || g_eventLoopThisThread == eventLoop);
+    serverAssert(g_eventLoopThisThread == NULL || g_eventLoopThisThread == eventLoop);
     if (fd >= eventLoop->setsize) return;
     aeFileEvent *fe = &eventLoop->events[fd];
     if (fe->mask == AE_NONE) return;
@@ -462,46 +461,24 @@ extern "C" int aeGetFileEvents(aeEventLoop *eventLoop, int fd) {
     return fe->mask;
 }
 
-static void aeGetTime(long *seconds, long *milliseconds)
-{
-    struct timeval tv;
-
-    gettimeofday(&tv, NULL);
-    *seconds = tv.tv_sec;
-    *milliseconds = tv.tv_usec/1000;
-}
-
-static void aeAddMillisecondsToNow(long long milliseconds, long *sec, long *ms) {
-    long cur_sec, cur_ms, when_sec, when_ms;
-
-    aeGetTime(&cur_sec, &cur_ms);
-    when_sec = cur_sec + milliseconds/1000;
-    when_ms = cur_ms + milliseconds%1000;
-    if (when_ms >= 1000) {
-        when_sec ++;
-        when_ms -= 1000;
-    }
-    *sec = when_sec;
-    *ms = when_ms;
-}
-
 extern "C" long long aeCreateTimeEvent(aeEventLoop *eventLoop, long long milliseconds,
         aeTimeProc *proc, void *clientData,
         aeEventFinalizerProc *finalizerProc)
 {
-    AE_ASSERT(g_eventLoopThisThread == NULL || g_eventLoopThisThread == eventLoop);
+    serverAssert(g_eventLoopThisThread == NULL || g_eventLoopThisThread == eventLoop);
     long long id = eventLoop->timeEventNextId++;
     aeTimeEvent *te;
 
     te = (aeTimeEvent*)zmalloc(sizeof(*te), MALLOC_LOCAL);
     if (te == NULL) return AE_ERR;
     te->id = id;
-    aeAddMillisecondsToNow(milliseconds,&te->when_sec,&te->when_ms);
+    te->when = getMonotonicUs() + milliseconds * 1000;
     te->timeProc = proc;
     te->finalizerProc = finalizerProc;
     te->clientData = clientData;
     te->prev = NULL;
     te->next = eventLoop->timeEventHead;
+    te->refcount = 0;
     if (te->next)
         te->next->prev = te;
     eventLoop->timeEventHead = te;
@@ -510,7 +487,7 @@ extern "C" long long aeCreateTimeEvent(aeEventLoop *eventLoop, long long millise
 
 extern "C" int aeDeleteTimeEvent(aeEventLoop *eventLoop, long long id)
 {
-    AE_ASSERT(g_eventLoopThisThread == NULL || g_eventLoopThisThread == eventLoop);
+    serverAssert(g_eventLoopThisThread == NULL || g_eventLoopThisThread == eventLoop);
     aeTimeEvent *te = eventLoop->timeEventHead;
     while(te) {
         if (te->id == id) {
@@ -522,10 +499,8 @@ extern "C" int aeDeleteTimeEvent(aeEventLoop *eventLoop, long long id)
     return AE_ERR; /* NO event with the specified ID found */
 }
 
-/* Search the first timer to fire.
- * This operation is useful to know how many time the select can be
- * put in sleep without to delay any event.
- * If there are no timers NULL is returned.
+/* How many microseconds until the first timer should fire.
+ * If there are no timers, -1 is returned.
  *
  * Note that's O(N) since time events are unsorted.
  * Possible optimizations (not needed by Redis so far, but...):
@@ -533,64 +508,59 @@ extern "C" int aeDeleteTimeEvent(aeEventLoop *eventLoop, long long id)
  *    Much better but still insertion or deletion of timers is O(N).
  * 2) Use a skiplist to have this operation as O(1) and insertion as O(log(N)).
  */
-static aeTimeEvent *aeSearchNearestTimer(aeEventLoop *eventLoop)
-{
-    AE_ASSERT(g_eventLoopThisThread == NULL || g_eventLoopThisThread == eventLoop);
+static int64_t usUntilEarliestTimer(aeEventLoop *eventLoop) {
     aeTimeEvent *te = eventLoop->timeEventHead;
-    aeTimeEvent *nearest = NULL;
+    if (te == NULL) return -1;
 
-    while(te) {
-        if (!nearest || te->when_sec < nearest->when_sec ||
-                (te->when_sec == nearest->when_sec &&
-                 te->when_ms < nearest->when_ms))
-            nearest = te;
+    aeTimeEvent *earliest = NULL;
+    while (te) {
+        if (!earliest || te->when < earliest->when)
+            earliest = te;
         te = te->next;
     }
-    return nearest;
+
+    monotime now = getMonotonicUs();
+    return (now >= earliest->when) ? 0 : earliest->when - now;
 }
 
 /* Process time events */
 static int processTimeEvents(aeEventLoop *eventLoop) {
-    std::unique_lock<decltype(g_lock)> ulock(g_lock);
+    std::unique_lock<decltype(g_lock)> ulock(g_lock, std::defer_lock);
     int processed = 0;
     aeTimeEvent *te;
     long long maxId;
-    time_t now = time(NULL);
-
-    /* If the system clock is moved to the future, and then set back to the
-     * right value, time events may be delayed in a random way. Often this
-     * means that scheduled operations will not be performed soon enough.
-     *
-     * Here we try to detect system clock skews, and force all the time
-     * events to be processed ASAP when this happens: the idea is that
-     * processing events earlier is less dangerous than delaying them
-     * indefinitely, and practice suggests it is. */
-    if (now < eventLoop->lastTime) {
-        te = eventLoop->timeEventHead;
-        while(te) {
-            te->when_sec = 0;
-            te = te->next;
-        }
-    }
-    eventLoop->lastTime = now;
 
     te = eventLoop->timeEventHead;
     maxId = eventLoop->timeEventNextId-1;
+    monotime now = getMonotonicUs();
     while(te) {
-        long now_sec, now_ms;
         long long id;
 
         /* Remove events scheduled for deletion. */
         if (te->id == AE_DELETED_EVENT_ID) {
             aeTimeEvent *next = te->next;
+            /* If a reference exists for this timer event,
+             * don't free it. This is currently incremented
+             * for recursive timerProc calls */
+            if (te->refcount) {
+                te = next;
+                continue;
+            }
             if (te->prev)
                 te->prev->next = te->next;
             else
                 eventLoop->timeEventHead = te->next;
             if (te->next)
                 te->next->prev = te->prev;
-            if (te->finalizerProc)
+            if (te->finalizerProc) {
+                if (!ulock.owns_lock()) {
+                    g_forkLock.releaseRead();
+                    ulock.lock();
+                    g_forkLock.acquireRead();
+                }
                 te->finalizerProc(eventLoop, te->clientData);
+                now = getMonotonicUs();
+            }
             zfree(te);
             te = next;
             continue;
@@ -605,17 +575,23 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
             te = te->next;
             continue;
         }
-        aeGetTime(&now_sec, &now_ms);
-        if (now_sec > te->when_sec ||
-            (now_sec == te->when_sec && now_ms >= te->when_ms))
-        {
+
+        if (te->when <= now) {
+            if (!ulock.owns_lock()) {
+                g_forkLock.releaseRead();
+                ulock.lock();
+                g_forkLock.acquireRead();
+            }
             int retval;
 
             id = te->id;
+            te->refcount++;
             retval = te->timeProc(eventLoop, id, te->clientData);
+            te->refcount--;
             processed++;
+            now = getMonotonicUs();
             if (retval != AE_NOMORE) {
-                aeAddMillisecondsToNow(retval,&te->when_sec,&te->when_ms);
+                te->when = now + retval * 1000;
             } else {
                 te->id = AE_DELETED_EVENT_ID;
             }
@@ -629,8 +605,11 @@ extern "C" void ProcessEventCore(aeEventLoop *eventLoop, aeFileEvent *fe, int ma
 {
 #define LOCK_IF_NECESSARY(fe, tsmask) \
     std::unique_lock<decltype(g_lock)> ulock(g_lock, std::defer_lock); \
-    if (!(fe->mask & tsmask)) \
-        ulock.lock()
+    if (!(fe->mask & tsmask)) { \
+        g_forkLock.releaseRead(); \
+        ulock.lock(); \
+        g_forkLock.acquireRead(); \
+    }
 
     int fired = 0; /* Number of events fired for current fd. */
 
@@ -657,6 +636,7 @@ extern "C" void ProcessEventCore(aeEventLoop *eventLoop, aeFileEvent *fe, int ma
         LOCK_IF_NECESSARY(fe, AE_READ_THREADSAFE);
         fe->rfileProc(eventLoop,fd,fe->clientData,mask | (fe->mask & AE_READ_THREADSAFE));
         fired++;
+        fe = &eventLoop->events[fd]; /* Refresh in case of resize. */
     }
 
     /* Fire the writable event. */
@@ -693,47 +673,34 @@ extern "C" void ProcessEventCore(aeEventLoop *eventLoop, aeFileEvent *fe, int ma
  * if flags has AE_DONT_WAIT set the function returns ASAP until all
  * the events that's possible to process without to wait are processed.
  * if flags has AE_CALL_AFTER_SLEEP set, the aftersleep callback is called.
+ * if flags has AE_CALL_BEFORE_SLEEP set, the beforesleep callback is called.
  *
  * The function returns the number of events processed. */
 int aeProcessEvents(aeEventLoop *eventLoop, int flags)
 {
-    AE_ASSERT(g_eventLoopThisThread == NULL || g_eventLoopThisThread == eventLoop);
+    serverAssert(g_eventLoopThisThread == NULL || g_eventLoopThisThread == eventLoop);
     int processed = 0, numevents;
 
     /* Nothing to do? return ASAP */
     if (!(flags & AE_TIME_EVENTS) && !(flags & AE_FILE_EVENTS)) return 0;
 
-    /* Note that we want call select() even if there are no
+    /* Note that we want to call select() even if there are no
      * file events to process as long as we want to process time
      * events, in order to sleep until the next time event is ready
      * to fire. */
     if (eventLoop->maxfd != -1 ||
         ((flags & AE_TIME_EVENTS) && !(flags & AE_DONT_WAIT))) {
         int j;
-        aeTimeEvent *shortest = NULL;
         struct timeval tv, *tvp;
+        int64_t usUntilTimer = -1;
 
         if (flags & AE_TIME_EVENTS && !(flags & AE_DONT_WAIT))
-            shortest = aeSearchNearestTimer(eventLoop);
-        if (shortest) {
-            long now_sec, now_ms;
+            usUntilTimer = usUntilEarliestTimer(eventLoop);
 
-            aeGetTime(&now_sec, &now_ms);
+        if (usUntilTimer >= 0) {
+            tv.tv_sec = usUntilTimer / 1000000;
+            tv.tv_usec = usUntilTimer % 1000000;
             tvp = &tv;
-
-            /* How many milliseconds we need to wait for the next
-             * time event to fire? */
-            long long ms =
-                (shortest->when_sec - now_sec)*1000 +
-                shortest->when_ms - now_ms;
-
-            if (ms > 0) {
-                tvp->tv_sec = ms/1000;
-                tvp->tv_usec = (ms % 1000)*1000;
-            } else {
-                tvp->tv_sec = 0;
-                tvp->tv_usec = 0;
-            }
         } else {
             /* If we have to check for events but need to return
              * ASAP because of AE_DONT_WAIT we need to set the timeout
@@ -747,6 +714,21 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
             }
         }
 
+        if (eventLoop->flags & AE_DONT_WAIT) {
+            tv.tv_sec = tv.tv_usec = 0;
+            tvp = &tv;
+        }
+
+        if (eventLoop->beforesleep != NULL && flags & AE_CALL_BEFORE_SLEEP) {
+            std::unique_lock<decltype(g_lock)> ulock(g_lock, std::defer_lock);
+            if (!(eventLoop->beforesleepFlags & AE_SLEEP_THREADSAFE)) {
+                g_forkLock.releaseRead();
+                ulock.lock();
+                g_forkLock.acquireRead();
+            }
+            eventLoop->beforesleep(eventLoop);
+        }
+
         /* Call the multiplexing API, will return only on timeout or when
          * some event fires. */
         numevents = aeApiPoll(eventLoop, tvp);
@@ -754,8 +736,11 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
         /* After sleep callback. */
         if (eventLoop->aftersleep != NULL && flags & AE_CALL_AFTER_SLEEP) {
             std::unique_lock<decltype(g_lock)> ulock(g_lock, std::defer_lock);
-            if (!(eventLoop->aftersleepFlags & AE_SLEEP_THREADSAFE))
+            if (!(eventLoop->aftersleepFlags & AE_SLEEP_THREADSAFE)) {
+                g_forkLock.releaseRead();
                 ulock.lock();
+                g_forkLock.acquireRead();
+            }
             eventLoop->aftersleep(eventLoop);
         }
 
@@ -803,15 +788,9 @@ void aeMain(aeEventLoop *eventLoop) {
     eventLoop->stop = 0;
     g_eventLoopThisThread = eventLoop;
     while (!eventLoop->stop) {
-        if (eventLoop->beforesleep != NULL) {
-            std::unique_lock<decltype(g_lock)> ulock(g_lock, std::defer_lock);
-            if (!(eventLoop->beforesleepFlags & AE_SLEEP_THREADSAFE))
-                ulock.lock();
-            eventLoop->beforesleep(eventLoop);
-        }
-        AE_ASSERT(!aeThreadOwnsLock()); // we should have relinquished it after processing
-        aeProcessEvents(eventLoop, AE_ALL_EVENTS|AE_CALL_AFTER_SLEEP);
-        AE_ASSERT(!aeThreadOwnsLock()); // we should have relinquished it after processing
+        serverAssert(!aeThreadOwnsLock()); // we should have relinquished it after processing
+        aeProcessEvents(eventLoop, AE_ALL_EVENTS|AE_CALL_BEFORE_SLEEP|AE_CALL_AFTER_SLEEP);
+        serverAssert(!aeThreadOwnsLock()); // we should have relinquished it after processing
     }
 }
 
@@ -829,9 +808,27 @@ void aeSetAfterSleepProc(aeEventLoop *eventLoop, aeBeforeSleepProc *aftersleep, 
     eventLoop->aftersleepFlags = flags;
 }
 
+thread_local spin_worker tl_worker = nullptr;
+void setAeLockSetThreadSpinWorker(spin_worker worker)
+{
+    tl_worker = worker;
+}
+
+void aeThreadOnline()
+{
+    g_forkLock.acquireRead();
+}
+
 void aeAcquireLock()
 {
-    g_lock.lock();
+    g_forkLock.releaseRead();
+    g_lock.lock(tl_worker);
+    g_forkLock.acquireRead();
+}
+
+void aeAcquireForkLock()
+{
+    g_forkLock.upgradeWrite();
 }
 
 int aeTryAcquireLock(int fWeak)
@@ -839,12 +836,30 @@ int aeTryAcquireLock(int fWeak)
     return g_lock.try_lock(!!fWeak);
 }
 
+void aeThreadOffline()
+{
+    g_forkLock.releaseRead();
+}
+
 void aeReleaseLock()
 {
     g_lock.unlock();
 }
 
+void aeReleaseForkLock()
+{
+    g_forkLock.downgradeWrite();
+}
+
 int aeThreadOwnsLock()
 {
     return g_lock.fOwnLock();
+}
+
+void aeClosePipesForForkChild(aeEventLoop *el)
+{
+    close(el->fdCmdRead);
+    el->fdCmdRead = -1;
+    close(el->fdCmdWrite);
+    el->fdCmdWrite = -1;
 }

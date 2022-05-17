@@ -1,43 +1,45 @@
 ![Current Release](https://img.shields.io/github/release/JohnSully/KeyDB.svg)
-[![Build Status](https://travis-ci.org/JohnSully/KeyDB.svg?branch=unstable)](https://travis-ci.org/JohnSully/KeyDB) [![Join the chat at https://gitter.im/KeyDB/community](https://badges.gitter.im/KeyDB/community.svg)](https://gitter.im/KeyDB/community?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
+![CI](https://github.com/JohnSully/KeyDB/workflows/CI/badge.svg?branch=unstable)
 [![StackShare](http://img.shields.io/badge/tech-stack-0690fa.svg?style=flat)](https://stackshare.io/eq-alpha-technology-inc/eq-alpha-technology-inc)
 
+##### Want to extend KeyDB with Javascript?  Try [ModJS](https://github.com/JohnSully/ModJS)
+
 ##### Need Help? Check out our extensive [documentation](https://docs.keydb.dev).
+
+##### NEW!!! KeyDB now has a Slack Community Workspace. Click [here](https://docs.keydb.dev/slack/) to learn more and join the KeyDB Community Slack workspace.
 
 What is KeyDB?
 --------------
 
 KeyDB is a high performance fork of Redis with a focus on multithreading, memory efficiency, and high throughput.  In addition to multithreading, KeyDB also has features only available in Redis Enterprise such as [Active Replication](https://github.com/JohnSully/KeyDB/wiki/Active-Replication), [FLASH storage](https://github.com/JohnSully/KeyDB/wiki/FLASH-Storage) support, and some not available at all such as direct backup to AWS S3. 
 
-KeyDB maintains full compatibility with the Redis protocol, modules, and scripts.  This includes the atomicity gurantees for scripts and transactions.  Because KeyDB keeps in sync with Redis development KeyDB is a superset of Redis functionality, making KeyDB a drop in replacement for existing Redis deployments.
+KeyDB maintains full compatibility with the Redis protocol, modules, and scripts.  This includes the atomicity guarantees for scripts and transactions.  Because KeyDB keeps in sync with Redis development KeyDB is a superset of Redis functionality, making KeyDB a drop in replacement for existing Redis deployments.
 
-On the same hardware KeyDB can perform twice as many queries per second as Redis, with 60% lower latency. Active-Replication simplifies hot-spare failover allowing you to easily distribute writes over replicas and use simple TCP based load balancing/failover. KeyDB's higher performance allows you to do more on less hardware which reduces operation costs and complexity.
+On the same hardware KeyDB can achieve significantly higher throughput than Redis. Active-Replication simplifies hot-spare failover allowing you to easily distribute writes over replicas and use simple TCP based load balancing/failover. KeyDB's higher performance allows you to do more on less hardware which reduces operation costs and complexity.
 
-<img src=https://cdn-images-1.medium.com/max/1400/1*s7mTb7Qb0kxc951mz8bdgA.png width=420 height=300/><img src=https://cdn-images-1.medium.com/max/1400/1*R00A5U4AFGohGOYHMfT6fA.png height=300/>
+The chart below compares several KeyDB and Redis setups, including the latest Redis6 io-threads option, and TLS benchmarks.
+
+<img src="https://docs.keydb.dev/img/blog/2020-09-15/ops_comparison.png"/>
+
+See the full benchmark results and setup information here: https://docs.keydb.dev/blog/2020/09/29/blog-post/
 
 Why fork Redis?
 ---------------
 
-KeyDB has a different philosophy on how the codebase should evolve.  We feel that ease of use, high performance, and a "batteries included" approach is the best way to create a good user experience.  While we have great respect for the Redis maintainers it is our opinion that the Redis approach focusses too much on simplicity of the code base at the expense of complexity for the user.  This results in the need for external components and workarounds to solve common problems - resulting in more complexity overall.
+KeyDB has a different philosophy on how the codebase should evolve.  We feel that ease of use, high performance, and a "batteries included" approach is the best way to create a good user experience.  While we have great respect for the Redis maintainers it is our opinion that the Redis approach focuses too much on simplicity of the code base at the expense of complexity for the user.  This results in the need for external components and workarounds to solve common problems - resulting in more complexity overall.
 
 Because of this difference of opinion features which are right for KeyDB may not be appropriate for Redis.  A fork allows us to explore this new development path and implement features which may never be a part of Redis.  KeyDB keeps in sync with upstream Redis changes, and where applicable we upstream bug fixes and changes. It is our hope that the two projects can continue to grow and learn from each other.
 
 Additional Resources
 --------------------
 
-Try our docker container: https://hub.docker.com/r/eqalpha/keydb
+Check out KeyDB's [Docker Image](https://hub.docker.com/r/eqalpha/keydb)
 
-Talk on Gitter: https://gitter.im/KeyDB
+Join us on [Slack](https://docs.keydb.dev/slack/)
 
-Visit our Website: https://keydb.dev
+Post to the [Community Forum](https://community.keydb.dev)
 
-See options for channel partners and support contracts: https://keydb.dev/support.html
-
-Learn with KeyDB’s official documentation site: https://docs.keydb.dev
-
-[Subscribe to the KeyDB mailing list](https://eqalpha.us20.list-manage.com/subscribe/post?u=978f486c2f95589b24591a9cc&id=4ab9220500)
-
-Management GUI: We recommend [FastoNoSQL](https://fastonosql.com/) which has official KeyDB support.
+Learn more through KeyDB's [Documentation & Learning Center](https://docs.keydb.dev)
 
 
 Benchmarking KeyDB
@@ -76,6 +78,8 @@ Building KeyDB
 
 KeyDB can be compiled and is tested for use on Linux.  KeyDB currently relies on SO_REUSEPORT's load balancing behavior which is available only in Linux.  When we support marshalling connections across threads we plan to support other operating systems such as FreeBSD.
 
+More on CentOS/Archlinux/Alpine/Debian/Ubuntu dependencies and builds can be found here: https://docs.keydb.dev/docs/build/
+
 Install dependencies:
 
     % sudo apt install build-essential nasm autotools-dev autoconf libjemalloc-dev tcl tcl-dev uuid-dev libcurl4-openssl-dev
@@ -84,17 +88,41 @@ Compiling is as simple as:
 
     % make
 
-You can enable flash support with:
+To build with TLS support, you'll need OpenSSL development libraries (e.g.
+libssl-dev on Debian/Ubuntu) and run:
 
-    % make MALLOC=memkind
+    % make BUILD_TLS=yes
+
+To build with systemd support, you'll need systemd development libraries (such 
+as libsystemd-dev on Debian/Ubuntu or systemd-devel on CentOS) and run:
+
+    % make USE_SYSTEMD=yes
+
+To append a suffix to KeyDB program names, use:
+
+    % make PROG_SUFFIX="-alt"
 
 ***Note that the following dependencies may be needed: 
     % sudo apt-get install autoconf autotools-dev libnuma-dev libtool
 
+If TLS is built, running the tests with TLS enabled (you will need `tcl-tls`
+installed):
+
+    % ./utils/gen-test-certs.sh
+    % ./runtest --tls
+
+
+If TLS is built, running the tests with TLS enabled (you will need `tcl-tls`
+installed):
+
+    % ./utils/gen-test-certs.sh
+    % ./runtest --tls
+
+
 Fixing build problems with dependencies or cached build options
 ---------
 
-KeyDB has some dependencies which are included into the `deps` directory.
+KeyDB has some dependencies which are included in the `deps` directory.
 `make` does not automatically rebuild dependencies even if something in
 the source code of dependencies changes.
 
@@ -121,7 +149,7 @@ with a 64 bit target, or the other way around, you need to perform a
 In case of build errors when trying to build a 32 bit binary of KeyDB, try
 the following steps:
 
-* Install the packages libc6-dev-i386 (also try g++-multilib).
+* Install the package libc6-dev-i386 (also try g++-multilib).
 * Try using the following command line instead of `make 32bit`:
   `make CFLAGS="-m32 -march=native" LDFLAGS="-m32"`
 
@@ -142,18 +170,30 @@ To compile against jemalloc on Mac OS X systems, use:
 
     % make MALLOC=jemalloc
 
+Monotonic clock
+---------------
+
+By default, KeyDB will build using the POSIX clock_gettime function as the
+monotonic clock source.  On most modern systems, the internal processor clock
+can be used to improve performance.  Cautions can be found here: 
+    http://oliveryang.net/2015/09/pitfalls-of-TSC-usage/
+
+To build with support for the processor's internal instruction clock, use:
+
+    % make CFLAGS="-DUSE_PROCESSOR_CLOCK"
+
 Verbose build
 -------------
 
 KeyDB will build with a user friendly colorized output by default.
-If you want to see a more verbose output use the following:
+If you want to see a more verbose output, use the following:
 
     % make V=1
 
 Running KeyDB
 -------------
 
-To run KeyDB with the default configuration just type:
+To run KeyDB with the default configuration, just type:
 
     % cd src
     % ./keydb-server
@@ -172,6 +212,14 @@ as options using the command line. Examples:
 
 All the options in keydb.conf are also supported as options using the command
 line, with exactly the same name.
+
+
+Running Redis with TLS:
+------------------
+
+Please consult the [TLS.md](TLS.md) file for more information on
+how to use Redis with TLS.
+
 
 Playing with KeyDB
 ------------------
@@ -198,7 +246,7 @@ You can find the list of all the available commands at https://docs.keydb.dev/do
 Installing KeyDB
 -----------------
 
-In order to install KeyDB binaries into /usr/local/bin just use:
+In order to install KeyDB binaries into /usr/local/bin, just use:
 
     % make install
 
@@ -207,8 +255,8 @@ different destination.
 
 Make install will just install binaries in your system, but will not configure
 init scripts and configuration files in the appropriate place. This is not
-needed if you want just to play a bit with KeyDB, but if you are installing
-it the proper way for a production system, we have a script doing this
+needed if you just want to play a bit with KeyDB, but if you are installing
+it the proper way for a production system, we have a script that does this
 for Ubuntu and Debian systems:
 
     % cd utils

@@ -1,4 +1,7 @@
 #pragma once
+#include "cli_common.h"
+#include <sdscompat.h> /* Use hiredis' sds compat header that maps sds calls to their hi_ variants */
+#include <sds.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -16,6 +19,7 @@ extern "C" {
 #define REDIS_CLI_RCFILE_ENV "REDISCLI_RCFILE"
 #define REDIS_CLI_RCFILE_DEFAULT ".redisclirc"
 #define REDIS_CLI_AUTH_ENV "REDISCLI_AUTH"
+#define REDIS_CLI_CLUSTER_YES_ENV "REDISCLI_CLUSTER_YES"
 
 #define CLUSTER_MANAGER_SLOTS               16384
 #define CLUSTER_MANAGER_MIGRATE_TIMEOUT     60000
@@ -66,6 +70,9 @@ extern "C" {
 #define CLUSTER_MANAGER_CMD_FLAG_COPY           1 << 7
 #define CLUSTER_MANAGER_CMD_FLAG_COLOR          1 << 8
 #define CLUSTER_MANAGER_CMD_FLAG_CHECK_OWNERS   1 << 9
+#define CLUSTER_MANAGER_CMD_FLAG_FIX_WITH_UNREACHABLE_MASTERS 1 << 10
+#define CLUSTER_MANAGER_CMD_FLAG_MASTERS_ONLY 1 << 11
+#define CLUSTER_MANAGER_CMD_FLAG_SLAVES_ONLY 1 << 12
 
 #define CLUSTER_MANAGER_OPT_GETFRIENDS  1 << 0
 #define CLUSTER_MANAGER_OPT_COLD        1 << 1
@@ -118,6 +125,9 @@ typedef struct clusterManagerCommand {
     int pipeline;
     float threshold;
     char *backup_dir;
+    char *from_user;
+    char *from_pass;
+    int from_askpass;
 } clusterManagerCommand;
 
 void createClusterManagerCommand(char *cmdname, int argc, char **argv);
@@ -127,9 +137,17 @@ extern struct config {
     char *hostip;
     int hostport;
     char *hostsocket;
+    int tls;
+    cliSSLconfig sslconfig;
+    char *sni;
+    char *cacert;
+    char *cacertdir;
+    char *cert;
+    char *key;
     long repeat;
     long interval;
-    int dbnum;
+    int dbnum; /* db num currently selected */
+    int input_dbnum; /* db num user input */
     int interactive;
     int shutdown;
     int monitor_mode;
@@ -141,6 +159,7 @@ extern struct config {
     long long lru_test_sample_size;
     int cluster_mode;
     int cluster_reissue_command;
+    int cluster_send_asking;
     int slave_mode;
     int pipe_mode;
     int pipe_timeout;
@@ -149,7 +168,7 @@ extern struct config {
     int scan_mode;
     int intrinsic_latency_mode;
     int intrinsic_latency_duration;
-    char *pattern;
+    sds pattern;
     char *rdb_filename;
     int bigkeys;
     int memkeys;
@@ -157,8 +176,12 @@ extern struct config {
     int hotkeys;
     int stdinarg; /* get last arg from stdin. (-x option) */
     char *auth;
+    int askpass;
+    char *user;
     int output; /* output mode, see OUTPUT_* defines */
+    int push_output; /* Should we display spontaneous PUSH replies */
     sds mb_delim;
+    sds cmd_delim;
     char prompt[128];
     char *eval;
     int eval_ldb;
@@ -167,15 +190,22 @@ extern struct config {
     int enable_ldb_on_eval; /* Handle manual SCRIPT DEBUG + EVAL commands. */
     int last_cmd_type;
     int verbose;
+    int set_errcode;
     clusterManagerCommand cluster_manager_command;
     int no_auth_warning;
+    int resp3;
+    int disable_motd;
+    int in_multi;
+    int pre_multi_dbnum;
+    int quoted_input;   /* Force input args to be treated as quoted strings */
 } config;
 
-/* The Cluster Manager global structure */
-extern struct clusterManager {
+struct clusterManager {
     list *nodes;    /* List of nodes in the configuration. */
     list *errors;
-} cluster_manager;
+    int unreachable_masters;    /* Masters we are not able to reach. */
+};
+extern struct clusterManager cluster_manager;
 
 typedef struct clusterManagerNode {
     redisContext *context;
@@ -217,6 +247,15 @@ typedef struct clusterManagerReshardTableItem {
     int slot;
 } clusterManagerReshardTableItem;
 
+/* Info about a cluster internal link. */
+
+typedef struct clusterManagerLink {
+    sds node_name;
+    sds node_addr;
+    int connected;
+    int handshaking;
+} clusterManagerLink;
+
 typedef struct typeinfo {
     char *name;
     char *sizecmd;
@@ -253,7 +292,7 @@ int parseClusterNodeAddress(char *addr, char **ip_ptr, int *port_ptr,
     int *bus_port_ptr);
 int clusterManagerCheckRedisReply(clusterManagerNode *n,
     redisReply *r, char **err);
-int confirmWithYes(const char *msg);
+int confirmWithYes(const char *msg, int force);
 int clusterManagerSetSlotOwner(clusterManagerNode *owner,
     int slot,
     int do_clear);

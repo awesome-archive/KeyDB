@@ -28,15 +28,21 @@
  */
 
 const char *ascii_logo =
-"                                                                     \n"
-"                                                                     \n"
-"                                        KeyDB %s (%s/%d) %s bit\n"
-"                                                                     \n"
-"                                        Running in %s mode\n"
-"                                        Port: %d\n"
-"                                        PID: %ld\n"
-"                                                                     \n"
-"                     Like KeyDB? Star us on GitHub!                  \n"
-"                                                                     \n"
-"                     https://github.com/JohnSully/KeyDB              \n"
-"                                                                     \n\n";
+"                                                                      \n"
+"                  _                                                   \n"
+"               _-(+)-_                                                \n"
+"            _-- /   \\ --_                                            \n"
+"         _--   /     \\   --_            KeyDB %s (%s/%d) %s bit      \n"
+"     __--     /       \\     --__                                     \n"
+"    (+) _    /         \\    _ (+)       Running in %s mode\n"
+"     |   -- /           \\ --   |        Port: %d\n"
+"     |     /--_   _   _--\\     |        PID: %ld\n"
+"     |    /     -(+)-     \\    |                                     \n"
+"     |   /        |        \\   |        https://docs.keydb.dev       \n"
+"     |  /         |         \\  |                                     \n"
+"     | /          |          \\ |                                     \n"
+"    (+)_ -- -- -- | -- -- -- _(+)                                     \n"
+"        --_       |       _--                                         \n"
+"            --_   |   _--                                             \n"
+"                -(+)-        %s\n"
+"                                                                     \n";

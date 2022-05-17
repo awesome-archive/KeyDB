@@ -36,7 +36,7 @@
 #ifdef __cplusplus
 #include <functional>
 #endif
-#include <time.h>
+#include "monotonic.h"
 #include "fastlock.h"
 
 #ifdef __cplusplus
@@ -58,11 +58,12 @@ extern "C" {
 #define AE_WRITE_THREADSAFE 16
 #define AE_SLEEP_THREADSAFE 32
 
-#define AE_FILE_EVENTS 1
-#define AE_TIME_EVENTS 2
+#define AE_FILE_EVENTS (1<<0)
+#define AE_TIME_EVENTS (1<<1)
 #define AE_ALL_EVENTS (AE_FILE_EVENTS|AE_TIME_EVENTS)
-#define AE_DONT_WAIT 4
-#define AE_CALL_AFTER_SLEEP 8
+#define AE_DONT_WAIT (1<<2)
+#define AE_CALL_BEFORE_SLEEP (1<<3)
+#define AE_CALL_AFTER_SLEEP (1<<4)
 
 #define AE_NOMORE -1
 #define AE_DELETED_EVENT_ID -1
@@ -90,13 +91,14 @@ typedef struct aeFileEvent {
 /* Time event structure */
 typedef struct aeTimeEvent {
     long long id; /* time event identifier. */
-    long when_sec; /* seconds */
-    long when_ms; /* milliseconds */
+    monotime when;
     aeTimeProc *timeProc;
     aeEventFinalizerProc *finalizerProc;
     void *clientData;
     struct aeTimeEvent *prev;
     struct aeTimeEvent *next;
+    int refcount; /* refcount to prevent timer events from being
+  		   * freed in recursive time event calls. */
 } aeTimeEvent;
 
 /* A fired event */
@@ -110,7 +112,6 @@ typedef struct aeEventLoop {
     int maxfd;   /* highest file descriptor currently registered */
     int setsize; /* max number of file descriptors tracked */
     long long timeEventNextId;
-    time_t lastTime;     /* Used to detect system clock skew */
     aeFileEvent *events; /* Registered events */
     aeFiredEvent *fired; /* Fired events */
     aeTimeEvent *timeEventHead;
@@ -124,6 +125,7 @@ typedef struct aeEventLoop {
     int fdCmdWrite;
     int fdCmdRead;
     int cevents;
+    int flags;
 } aeEventLoop;
 
 /* Prototypes */
@@ -131,7 +133,7 @@ aeEventLoop *aeCreateEventLoop(int setsize);
 int aePostFunction(aeEventLoop *eventLoop, aePostFunctionProc *proc, void *arg);
 #ifdef __cplusplus
 }   // EXTERN C
-int aePostFunction(aeEventLoop *eventLoop, std::function<void()> fn, bool fSynchronous = false);
+int aePostFunction(aeEventLoop *eventLoop, std::function<void()> fn, bool fLock = true, bool fForceQueue = false);
 extern "C" {
 #endif
 void aeDeleteEventLoop(aeEventLoop *eventLoop);
@@ -140,7 +142,7 @@ int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
         aeFileProc *proc, void *clientData);
 
 int aeCreateRemoteFileEvent(aeEventLoop *eventLoop, int fd, int mask,
-        aeFileProc *proc, void *clientData, int fSynchronous);
+        aeFileProc *proc, void *clientData);
 
 void aeDeleteFileEvent(aeEventLoop *eventLoop, int fd, int mask);
 void aeDeleteFileEventAsync(aeEventLoop *eventLoop, int fd, int mask);
@@ -156,11 +158,19 @@ const char *aeGetApiName(void);
 void aeSetBeforeSleepProc(aeEventLoop *eventLoop, aeBeforeSleepProc *beforesleep, int flags);
 void aeSetAfterSleepProc(aeEventLoop *eventLoop, aeBeforeSleepProc *aftersleep, int flags);
 int aeGetSetSize(aeEventLoop *eventLoop);
+aeEventLoop *aeGetCurrentEventLoop();
 int aeResizeSetSize(aeEventLoop *eventLoop, int setsize);
+void aeSetDontWait(aeEventLoop *eventLoop, int noWait);
+void aeClosePipesForForkChild(aeEventLoop *eventLoop);
 
+void setAeLockSetThreadSpinWorker(spin_worker worker);
+void aeThreadOnline();
 void aeAcquireLock();
+void aeAcquireForkLock();
 int aeTryAcquireLock(int fWeak);
+void aeThreadOffline();
 void aeReleaseLock();
+void aeReleaseForkLock();
 int aeThreadOwnsLock();
 
 #ifdef __cplusplus

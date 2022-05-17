@@ -52,9 +52,9 @@ tags {"aof"} {
             assert_equal 1 [is_alive $srv]
         }
 
-        set client [redis [dict get $srv host] [dict get $srv port]]
-
         test "Truncated AOF loaded: we expect foo to be equal to 5" {
+            set client [redis [dict get $srv host] [dict get $srv port] 0 $::tls]
+            wait_done_loading $client
             assert {[$client get foo] eq "5"}
         }
 
@@ -69,9 +69,9 @@ tags {"aof"} {
             assert_equal 1 [is_alive $srv]
         }
 
-        set client [redis [dict get $srv host] [dict get $srv port]]
-
         test "Truncated AOF loaded: we expect foo to be equal to 6 now" {
+            set client [redis [dict get $srv host] [dict get $srv port] 0 $::tls]
+            wait_done_loading $client
             assert {[$client get foo] eq "6"}
         }
     }
@@ -158,6 +158,18 @@ tags {"aof"} {
         assert_match "*not valid*" $result
     }
 
+    test "Short read: Utility should show the abnormal line num in AOF" {
+        create_aof {
+            append_to_aof [formatCommand set foo hello]
+            append_to_aof "!!!"
+        }
+
+        catch {
+            exec src/keydb-check-aof $aof_path
+        } result
+        assert_match "*ok_up_to_line=8*" $result
+    }
+
     test "Short read: Utility should be able to fix the AOF" {
         set result [exec src/keydb-check-aof --fix $aof_path << "y\n"]
         assert_match "*Successfully truncated AOF*" $result
@@ -170,12 +182,8 @@ tags {"aof"} {
         }
 
         test "Fixed AOF: Keyspace should contain values that were parseable" {
-            set client [redis [dict get $srv host] [dict get $srv port]]
-            wait_for_condition 50 100 {
-                [catch {$client ping} e] == 0
-            } else {
-                fail "Loading DB is taking too much time."
-            }
+            set client [redis [dict get $srv host] [dict get $srv port] 0 $::tls]
+            wait_done_loading $client
             assert_equal "hello" [$client get foo]
             assert_equal "" [$client get bar]
         }
@@ -194,12 +202,8 @@ tags {"aof"} {
         }
 
         test "AOF+SPOP: Set should have 1 member" {
-            set client [redis [dict get $srv host] [dict get $srv port]]
-            wait_for_condition 50 100 {
-                [catch {$client ping} e] == 0
-            } else {
-                fail "Loading DB is taking too much time."
-            }
+            set client [redis [dict get $srv host] [dict get $srv port] 0 $::tls]
+            wait_done_loading $client
             assert_equal 1 [$client scard set]
         }
     }
@@ -218,12 +222,8 @@ tags {"aof"} {
         }
 
         test "AOF+SPOP: Set should have 1 member" {
-            set client [redis [dict get $srv host] [dict get $srv port]]
-            wait_for_condition 50 100 {
-                [catch {$client ping} e] == 0
-            } else {
-                fail "Loading DB is taking too much time."
-            }
+            set client [redis [dict get $srv host] [dict get $srv port] 0 $::tls]
+            wait_done_loading $client
             assert_equal 1 [$client scard set]
         }
     }
@@ -241,12 +241,8 @@ tags {"aof"} {
         }
 
         test "AOF+EXPIRE: List should be empty" {
-            set client [redis [dict get $srv host] [dict get $srv port]]
-            wait_for_condition 50 100 {
-                [catch {$client ping} e] == 0
-            } else {
-                fail "Loading DB is taking too much time."
-            }
+            set client [redis [dict get $srv host] [dict get $srv port] 0 $::tls]
+            wait_done_loading $client
             assert_equal 0 [$client llen list]
         }
     }
@@ -255,6 +251,72 @@ tags {"aof"} {
         test {Redis should not try to convert DEL into EXPIREAT for EXPIRE -1} {
             r set x 10
             r expire x -1
+        }
+    }
+
+    # Because of how this test works its inherently unreliable with multithreading, so force threads 1
+    #   No real client should rely on this undocumented behavior
+    start_server {overrides {appendonly {yes} appendfilename {appendonly.aof} appendfsync always server-threads 1}} {
+        test {AOF fsync always barrier issue} {
+            set rd [redis_deferring_client]
+            # Set a sleep when aof is flushed, so that we have a chance to look
+            # at the aof size and detect if the response of an incr command
+            # arrives before the data was written (and hopefully fsynced)
+            # We create a big reply, which will hopefully not have room in the
+            # socket buffers, and will install a write handler, then we sleep
+            # a big and issue the incr command, hoping that the last portion of
+            # the output buffer write, and the processing of the incr will happen
+            # in the same event loop cycle.
+            # Since the socket buffers and timing are unpredictable, we fuzz this
+            # test with slightly different sizes and sleeps a few times.
+            for {set i 0} {$i < 10} {incr i} {
+                r debug aof-flush-sleep 0
+                r del x
+                r setrange x [expr {int(rand()*5000000)+10000000}] x
+                r debug aof-flush-sleep 500000
+                set aof [file join [lindex [r config get dir] 1] appendonly.aof]
+                set size1 [file size $aof]
+                $rd get x
+                after [expr {int(rand()*30)}]
+                $rd incr new_value
+                $rd read
+                $rd read
+                set size2 [file size $aof]
+                assert {$size1 != $size2}
+            }
+        }
+    }
+    
+    ## Test that PEXPIREMEMBERAT is loaded correctly
+    create_aof {
+        append_to_aof [formatCommand sadd testkey a b c d]
+        append_to_aof [formatCommand pexpirememberat testkey a 1000]
+    }
+
+    start_server_aof [list dir $server_path aof-load-truncated no] {
+        test "AOF+EXPIREMEMBER: Server shuold have been started" {
+            assert_equal 1 [is_alive $srv]
+        }
+
+        test "AOF+PEXPIREMEMBERAT: set should have 3 values" {
+            set client [redis [dict get $srv host] [dict get $srv port] 0 $::tls]
+            wait_for_condition 50 100 {
+                [catch {$client ping} e] == 0
+            } else {
+                fail "Loading DB is taking too much time."
+            }
+            assert_equal 3 [$client scard testkey]
+        }
+    }
+
+    start_server {overrides {appendonly {yes} appendfilename {appendonly.aof}}} {
+        test {GETEX should not append to AOF} {
+            set aof [file join [lindex [r config get dir] 1] appendonly.aof]
+            r set foo bar
+            set before [file size $aof]
+            r getex foo
+            set after [file size $aof]
+            assert_equal $before $after
         }
     }
 }

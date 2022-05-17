@@ -31,29 +31,7 @@
  */
 
 #include "server.h"
-
-void activeExpireCycleExpireFullKey(redisDb *db, const char *key) {
-    robj *keyobj = createStringObject(key,sdslen(key));
-
-    propagateExpire(db,keyobj,g_pserver->lazyfree_lazy_expire);
-    if (g_pserver->lazyfree_lazy_expire)
-        dbAsyncDelete(db,keyobj);
-    else
-        dbSyncDelete(db,keyobj);
-    notifyKeyspaceEvent(NOTIFY_EXPIRED,
-        "expired",keyobj,db->id);
-    if (g_pserver->tracking_clients) trackingInvalidateKey(keyobj);
-    decrRefCount(keyobj);
-    g_pserver->stat_expiredkeys++;
-}
-
-/*-----------------------------------------------------------------------------
- * Incremental collection of expired keys.
- *
- * When keys are accessed they are expired on-access. However we need a
- * mechanism in order to ensure keys are eventually removed when expired even
- * if no access is performed on them.
- *----------------------------------------------------------------------------*/
+#include "cron.h"
 
 /* Helper function for the activeExpireCycle() function.
  * This function will try to expire the key that is stored in the hash table
@@ -66,19 +44,54 @@ void activeExpireCycleExpireFullKey(redisDb *db, const char *key) {
  *
  * The parameter 'now' is the current time in milliseconds as is passed
  * to the function to avoid too many gettimeofday() syscalls. */
-void activeExpireCycleExpire(redisDb *db, expireEntry &e, long long now) {
+void activeExpireCycleExpireFullKey(redisDb *db, const char *key) {
+    robj *keyobj = createStringObject(key,sdslen(key));
+    mstime_t expire_latency;
+
+    propagateExpire(db,keyobj,g_pserver->lazyfree_lazy_expire);
+    latencyStartMonitor(expire_latency);
+    if (g_pserver->lazyfree_lazy_expire)
+        dbAsyncDelete(db,keyobj);
+    else
+        dbSyncDelete(db,keyobj);
+    latencyEndMonitor(expire_latency);
+    latencyAddSampleIfNeeded("expire-del",expire_latency);
+    notifyKeyspaceEvent(NOTIFY_EXPIRED,
+        "expired",keyobj,db->id);
+    signalModifiedKey(NULL, db, keyobj);
+    decrRefCount(keyobj);
+    g_pserver->stat_expiredkeys++;
+}
+
+/*-----------------------------------------------------------------------------
+ * Incremental collection of expired keys.
+ *
+ * When keys are accessed they are expired on-access. However we need a
+ * mechanism in order to ensure keys are eventually removed when expired even
+ * if no access is performed on them.
+ *----------------------------------------------------------------------------*/
+
+
+int activeExpireCycleExpire(redisDb *db, expireEntry &e, long long now, size_t &tried) {
     if (!e.FFat())
     {
         activeExpireCycleExpireFullKey(db, e.key());
-        return;
+        ++tried;
+        return 1;
     }
 
     expireEntryFat *pfat = e.pfatentry();
-    dictEntry *de = dictFind(db->pdict, e.key());
+    dictEntry *de = dictFind(db->dict, e.key());
     robj *val = (robj*)dictGetVal(de);
     int deleted = 0;
+
+    redisObjectStack objKey;
+    initStaticStringObject(objKey, (char*)e.key());
+    bool fTtlChanged = false;
+
     while (!pfat->FEmpty())
     {
+        ++tried;
         if (pfat->nextExpireEntry().when > now)
             break;
 
@@ -86,7 +99,7 @@ void activeExpireCycleExpire(redisDb *db, expireEntry &e, long long now) {
         if (pfat->nextExpireEntry().spsubkey == nullptr)
         {
             activeExpireCycleExpireFullKey(db, e.key());
-            return;
+            return ++deleted;
         }
 
         switch (val->type)
@@ -96,38 +109,150 @@ void activeExpireCycleExpire(redisDb *db, expireEntry &e, long long now) {
                 deleted++;
                 if (setTypeSize(val) == 0) {
                     activeExpireCycleExpireFullKey(db, e.key());
-                    return;
+                    return deleted;
                 }
             }
             break;
-        case OBJ_LIST:
-        case OBJ_ZSET:
+
         case OBJ_HASH:
+            if (hashTypeDelete(val,(sds)pfat->nextExpireEntry().spsubkey.get())) {
+                deleted++;
+                if (hashTypeLength(val) == 0) {
+                    activeExpireCycleExpireFullKey(db, e.key());
+                    return deleted;
+                }
+            }
+            break;
+
+        case OBJ_ZSET:
+            if (zsetDel(val,(sds)pfat->nextExpireEntry().spsubkey.get())) {
+                deleted++;
+                if (zsetLength(val) == 0) {
+                    activeExpireCycleExpireFullKey(db, e.key());
+                    return deleted;
+                }
+            }
+            break;
+
+        case OBJ_CRON:
+        {
+            sds keyCopy = sdsdup(e.key());
+            incrRefCount(val);
+            aePostFunction(g_pserver->rgthreadvar[IDX_EVENT_LOOP_MAIN].el, [keyCopy, val]{
+                executeCronJobExpireHook(keyCopy, val);
+                sdsfree(keyCopy);
+                decrRefCount(val);
+            }, true /*fLock*/, true /*fForceQueue*/);
+        }
+            return deleted;
+
+        case OBJ_LIST:
         default:
             serverAssert(false);
         }
+        
+        redisObjectStack objSubkey;
+        initStaticStringObject(objSubkey, (char*)pfat->nextExpireEntry().spsubkey.get());
+        propagateSubkeyExpire(db, val->type, &objKey, &objSubkey);
+        
         pfat->popfrontExpireEntry();
+        fTtlChanged = true;
+        if ((tried % ACTIVE_EXPIRE_CYCLE_SUBKEY_LOOKUPS_PER_LOOP) == 0) {
+            break;
+        }
+    }
+
+    if (!pfat->FEmpty() && fTtlChanged)
+    {
+        // We need to resort the expire entry since it may no longer be in the correct position
+        auto itr = db->setexpire->find(e.key());
+        expireEntry eT = std::move(e);
+        db->setexpire->erase(itr);
+        db->setexpire->insert(eT);
     }
 
     if (deleted)
     {
-        robj objT;
         switch (val->type)
         {
         case OBJ_SET:
-            initStaticStringObject(objT, (char*)e.key());
-            signalModifiedKey(db,&objT);
-            notifyKeyspaceEvent(NOTIFY_SET,"srem",&objT,db->id);
+            signalModifiedKey(nullptr, db,&objKey);
+            notifyKeyspaceEvent(NOTIFY_SET,"srem",&objKey,db->id);
             break;
         }
     }
 
     if (pfat->FEmpty())
     {
-        robj *keyobj = createStringObject(e.key(),sdslen(e.key()));
-        removeExpire(db, keyobj);
-        decrRefCount(keyobj);
+        removeExpire(db, &objKey);
     }
+    return deleted;
+}
+
+int parseUnitString(const char *sz)
+{
+    if (strcasecmp(sz, "s") == 0)
+        return UNIT_SECONDS;
+    if (strcasecmp(sz, "ms") == 0)
+        return UNIT_MILLISECONDS;
+    return -1;
+}
+
+void expireMemberCore(client *c, robj *key, robj *subkey, long long basetime, long long when, int unit)
+{
+    switch (unit)
+    {
+    case UNIT_SECONDS:
+        when *= 1000;
+    case UNIT_MILLISECONDS:
+        break;
+    
+    default:
+        addReplyError(c, "Invalid unit arg");
+        return;
+    }
+    
+    when += basetime;
+
+    /* No key, return zero. */
+    robj *val = lookupKeyWriteOrReply(c, key, shared.czero);
+    if (val == NULL) {
+        return;
+    }
+
+    double dblT;
+    switch (val->type)
+    {
+    case OBJ_SET:
+        if (!setTypeIsMember(val, szFromObj(subkey))) {
+            addReply(c,shared.czero);
+            return;
+        }
+        break;
+
+    case OBJ_HASH:
+        if (!hashTypeExists(val, szFromObj(subkey))) {
+            addReply(c,shared.czero);
+            return;
+        }
+        break;
+
+    case OBJ_ZSET:
+        if (zsetScore(val, szFromObj(subkey), &dblT) == C_ERR) {
+            addReply(c,shared.czero);
+            return;
+        }
+        break;
+
+    default:
+        addReplyError(c, "object type is unsupported");
+        return;
+    }
+
+    setExpire(c, c->db, key, subkey, when);
+    signalModifiedKey(c, c->db, key);
+    g_pserver->dirty++;
+    addReply(c, shared.cone);
 }
 
 void expireMemberCommand(client *c)
@@ -136,32 +261,35 @@ void expireMemberCommand(client *c)
     if (getLongLongFromObjectOrReply(c, c->argv[3], &when, NULL) != C_OK)
         return;
 
-    when *= 1000;
-    when += mstime();
-
-    /* No key, return zero. */
-    dictEntry *de = dictFind(c->db->pdict, szFromObj(c->argv[1]));
-    if (de == NULL) {
-        addReply(c,shared.czero);
+    if (c->argc > 5) {
+        addReplyError(c, "Invalid number of arguments");
         return;
     }
 
-    robj *val = (robj*)dictGetVal(de);
-
-    switch (val->type)
-    {
-    case OBJ_SET:
-        // these types are safe
-        break;
-
-    default:
-        addReplyError(c, "object type is unsupported");
-        return;
+    int unit = UNIT_SECONDS;
+    if (c->argc == 5) {
+        unit = parseUnitString(szFromObj(c->argv[4]));
     }
 
-    setExpire(c, c->db, c->argv[1], c->argv[2], when);
+    expireMemberCore(c, c->argv[1], c->argv[2], mstime(), when, unit);
+}
 
-    addReply(c, shared.ok);
+void expireMemberAtCommand(client *c)
+{
+    long long when;
+    if (getLongLongFromObjectOrReply(c, c->argv[3], &when, NULL) != C_OK)
+        return;
+
+    expireMemberCore(c, c->argv[1], c->argv[2], 0, when, UNIT_SECONDS);
+}
+
+void pexpireMemberAtCommand(client *c)
+{
+    long long when;
+    if (getLongLongFromObjectOrReply(c, c->argv[3], &when, NULL) != C_OK)
+        return;
+
+    expireMemberCore(c, c->argv[1], c->argv[2], 0, when, UNIT_MILLISECONDS);
 }
 
 /* Try to expire a few timed out keys. The algorithm used is adaptive and
@@ -169,8 +297,14 @@ void expireMemberCommand(client *c)
  * it will get more aggressive to avoid that too much memory is used by
  * keys that can be removed from the keyspace.
  *
- * No more than CRON_DBS_PER_CALL databases are tested at every
- * iteration.
+ * Every expire cycle tests multiple databases: the next call will start
+ * again from the next db. No more than CRON_DBS_PER_CALL databases are
+ * tested at every iteration.
+ *
+ * The function can perform more or less work, depending on the "type"
+ * argument. It can execute a "fast cycle" or a "slow cycle". The slow
+ * cycle is the main way we collect expired cycles: this happens with
+ * the "server.hz" frequency (usually 10 hertz).
  *
  * This kind of call is used when Redis detects that timelimit_exit is
  * true, so there is more work to do, and we do it more incrementally from
@@ -179,17 +313,17 @@ void expireMemberCommand(client *c)
  * Expire cycle type:
  *
  * If type is ACTIVE_EXPIRE_CYCLE_FAST the function will try to run a
- * "fast" expire cycle that takes no longer than EXPIRE_FAST_CYCLE_DURATION
+ * "fast" expire cycle that takes no longer than ACTIVE_EXPIRE_CYCLE_FAST_DURATION
  * microseconds, and is not repeated again before the same amount of time.
  *
  * If type is ACTIVE_EXPIRE_CYCLE_SLOW, that normal expire cycle is
  * executed, where the time limit is a percentage of the REDIS_HZ period
  * as specified by the ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC define. */
 
-void activeExpireCycle(int type) {
+void activeExpireCycleCore(int type) {
     /* This function has some global state in order to continue the work
      * incrementally across calls. */
-    static unsigned int current_db = 0; /* Last DB tested. */
+    static unsigned int current_db = 0; /* Next DB to test. */
     static int timelimit_exit = 0;      /* Time limit hit in previous call? */
     static long long last_fast_cycle = 0; /* When last fast cycle ran. */
 
@@ -200,7 +334,7 @@ void activeExpireCycle(int type) {
     /* When clients are paused the dataset should be static not just from the
      * POV of clients not being able to write, but also from the POV of
      * expires and evictions of keys not being performed. */
-    if (clientsArePaused()) return;
+    if (checkClientPauseTimeoutAndReturnIfPaused()) return;
 
     if (type == ACTIVE_EXPIRE_CYCLE_FAST) {
         /* Don't start a fast cycle if the previous cycle did not exit
@@ -264,10 +398,8 @@ void activeExpireCycle(int type) {
         db->expireitr = db->setexpire->enumerate(db->expireitr, now, [&](expireEntry &e) __attribute__((always_inline)) {
             if (e.when() < now)
             {
-                activeExpireCycleExpire(db, e, now);
-                ++expired;
+                expired += activeExpireCycleExpire(db, e, now, tried);
             }
-            ++tried;
 
             if ((tried % ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP) == 0)
             {
@@ -302,22 +434,27 @@ void activeExpireCycle(int type) {
                                      (g_pserver->stat_expired_stale_perc*0.95);
 }
 
+void activeExpireCycle(int type)
+{
+    runAndPropogateToReplicas(activeExpireCycleCore, type);
+}
+
 /*-----------------------------------------------------------------------------
  * Expires of keys created in writable slaves
  *
  * Normally slaves do not process expires: they wait the masters to synthesize
  * DEL operations in order to retain consistency. However writable slaves are
- * an exception: if a key is created in the slave and an expire is assigned
+ * an exception: if a key is created in the replica and an expire is assigned
  * to it, we need a way to expire such a key, since the master does not know
  * anything about such a key.
  *
- * In order to do so, we track keys created in the slave side with an expire
+ * In order to do so, we track keys created in the replica side with an expire
  * set, and call the expireSlaveKeys() function from time to time in order to
  * reclaim the keys if they already expired.
  *
  * Note that the use case we are trying to cover here, is a popular one where
  * slaves are put in writable mode in order to compute slow operations in
- * the slave side that are mostly useful to actually read data in a more
+ * the replica side that are mostly useful to actually read data in a more
  * processed way. Think at sets intersections in a tmp key, with an expire so
  * that it is also used as a cache to avoid intersecting every time.
  *
@@ -326,7 +463,7 @@ void activeExpireCycle(int type) {
  *----------------------------------------------------------------------------*/
 
 /* The dictionary where we remember key names and database ID of keys we may
- * want to expire from the slave. Since this function is not often used we
+ * want to expire from the replica. Since this function is not often used we
  * don't even care to initialize the database at startup. We'll do it once
  * the feature is used the first time, that is, when rememberSlaveKeyWithExpire()
  * is called.
@@ -361,7 +498,7 @@ void expireSlaveKeys(void) {
                 redisDb *db = g_pserver->db+dbid;
 
                 // the expire is hashed based on the key pointer, so we need the point in the main db
-                dictEntry *deMain = dictFind(db->pdict, keyname);
+                dictEntry *deMain = dictFind(db->dict, keyname);
                 auto itr = db->setexpire->end();
                 if (deMain != nullptr)
                     itr = db->setexpire->find((sds)dictGetKey(deMain));
@@ -370,8 +507,8 @@ void expireSlaveKeys(void) {
                 if (itr != db->setexpire->end())
                 {
                     if (itr->when() < start) {
-                        activeExpireCycleExpire(g_pserver->db+dbid,*itr,start);
-                        expired = 1;
+                        size_t tried = 0;
+                        expired = activeExpireCycleExpire(g_pserver->db+dbid,*itr,start,tried);
                     }
                 }
 
@@ -389,14 +526,14 @@ void expireSlaveKeys(void) {
         }
 
         /* Set the new bitmap as value of the key, in the dictionary
-         * of keys with an expire set directly in the writable slave. Otherwise
+         * of keys with an expire set directly in the writable replica. Otherwise
          * if the bitmap is zero, we no longer need to keep track of it. */
         if (new_dbids)
             dictSetUnsignedIntegerVal(de,new_dbids);
         else
             dictDelete(slaveKeysWithExpire,keyname);
 
-        /* Stop conditions: found 3 keys we cna't expire in a row or
+        /* Stop conditions: found 3 keys we can't expire in a row or
          * time limit was reached. */
         cycles++;
         if (noexpire > 3) break;
@@ -406,7 +543,7 @@ void expireSlaveKeys(void) {
 }
 
 /* Track keys that received an EXPIRE or similar command in the context
- * of a writable slave. */
+ * of a writable replica. */
 void rememberSlaveKeyWithExpire(redisDb *db, robj *key) {
     if (slaveKeysWithExpire == NULL) {
         static dictType dt = {
@@ -415,7 +552,8 @@ void rememberSlaveKeyWithExpire(redisDb *db, robj *key) {
             NULL,                       /* val dup */
             dictSdsKeyCompare,          /* key compare */
             dictSdsDestructor,          /* key destructor */
-            NULL                        /* val destructor */
+            NULL,                       /* val destructor */
+            NULL                        /* allow to expand */
         };
         slaveKeysWithExpire = dictCreate(&dt,NULL);
     }
@@ -448,7 +586,7 @@ size_t getSlaveKeyWithExpireCount(void) {
  *
  * Note: technically we should handle the case of a single DB being flushed
  * but it is not worth it since anyway race conditions using the same set
- * of key names in a wriatable slave and in its master will lead to
+ * of key names in a writable replica and in its master will lead to
  * inconsistencies. This is just a best-effort thing we do. */
 void flushSlaveKeysWithExpireList(void) {
     if (slaveKeysWithExpire) {
@@ -457,12 +595,22 @@ void flushSlaveKeysWithExpireList(void) {
     }
 }
 
+int checkAlreadyExpired(long long when) {
+    /* EXPIRE with negative TTL, or EXPIREAT with a timestamp into the past
+     * should never be executed as a DEL when load the AOF or in the context
+     * of a slave instance.
+     *
+     * Instead we add the already expired key to the database with expire time
+     * (possibly in the past) and wait for an explicit DEL from the master. */
+    return (when <= mstime() && !g_pserver->loading && (!listLength(g_pserver->masters) || g_pserver->fActiveReplica));
+}
+
 /*-----------------------------------------------------------------------------
  * Expires Commands
  *----------------------------------------------------------------------------*/
 
 /* This is the generic command implementation for EXPIRE, PEXPIRE, EXPIREAT
- * and PEXPIREAT. Because the commad second argument may be relative or absolute
+ * and PEXPIREAT. Because the command second argument may be relative or absolute
  * the "basetime" argument is used to signal what the base time is (either 0
  * for *AT variants of the command, or the current time for relative expires).
  *
@@ -474,23 +622,22 @@ void expireGenericCommand(client *c, long long basetime, int unit) {
 
     if (getLongLongFromObjectOrReply(c, param, &when, NULL) != C_OK)
         return;
-
+    int negative_when = when < 0;
     if (unit == UNIT_SECONDS) when *= 1000;
     when += basetime;
-
+    if (((when < 0) && !negative_when) || ((when-basetime > 0) && negative_when)) {
+        /* EXPIRE allows negative numbers, but we can at least detect an
+         * overflow by either unit conversion or basetime addition. */
+        addReplyErrorFormat(c, "invalid expire time in %s", c->cmd->name);
+        return;
+    }
     /* No key, return zero. */
     if (lookupKeyWrite(c->db,key) == NULL) {
         addReply(c,shared.czero);
         return;
     }
 
-    /* EXPIRE with negative TTL, or EXPIREAT with a timestamp into the past
-     * should never be executed as a DEL when load the AOF or in the context
-     * of a slave instance.
-     *
-     * Instead we take the other branch of the IF statement setting an expire
-     * (possibly in the past) and wait for an explicit DEL from the master. */
-    if (when <= mstime() && !g_pserver->loading && !listLength(g_pserver->masters)) {
+    if (checkAlreadyExpired(when)) {
         robj *aux;
 
         int deleted = g_pserver->lazyfree_lazy_expire ? dbAsyncDelete(c->db,key) :
@@ -501,14 +648,14 @@ void expireGenericCommand(client *c, long long basetime, int unit) {
         /* Replicate/AOF this as an explicit DEL or UNLINK. */
         aux = g_pserver->lazyfree_lazy_expire ? shared.unlink : shared.del;
         rewriteClientCommandVector(c,2,aux,key);
-        signalModifiedKey(c->db,key);
+        signalModifiedKey(c,c->db,key);
         notifyKeyspaceEvent(NOTIFY_GENERIC,"del",key,c->db->id);
         addReply(c, shared.cone);
         return;
     } else {
         setExpire(c,c->db,key,nullptr,when);
         addReply(c,shared.cone);
-        signalModifiedKey(c->db,key);
+        signalModifiedKey(c,c->db,key);
         notifyKeyspaceEvent(NOTIFY_GENERIC,"expire",key,c->db->id);
         g_pserver->dirty++;
         return;
@@ -537,20 +684,41 @@ void pexpireatCommand(client *c) {
 
 /* Implements TTL and PTTL */
 void ttlGenericCommand(client *c, int output_ms) {
-    long long expire = -1, ttl = -1;
+    long long expire = INVALID_EXPIRE, ttl = -1;
 
     /* If the key does not exist at all, return -2 */
     if (lookupKeyReadWithFlags(c->db,c->argv[1],LOOKUP_NOTOUCH) == nullptr) {
         addReplyLongLong(c,-2);
         return;
     }
+
     /* The key exists. Return -1 if it has no expire, or the actual
-     * TTL value otherwise. */
+        * TTL value otherwise. */
     expireEntry *pexpire = getExpire(c->db,c->argv[1]);
-    if (pexpire != nullptr)
-        pexpire->FGetPrimaryExpire(&expire);
+
+    if (c->argc == 2) {
+        // primary expire    
+        if (pexpire != nullptr)
+            pexpire->FGetPrimaryExpire(&expire);
+    } else if (c->argc == 3) {
+        // We want a subkey expire
+        if (pexpire && pexpire->FFat()) {
+            for (auto itr : *pexpire) {
+                if (itr.subkey() == nullptr)
+                    continue;
+                if (sdscmp((sds)itr.subkey(), szFromObj(c->argv[2])) == 0) {
+                    expire = itr.when();
+                    break;
+                }
+            }
+        }
+    } else {
+        addReplyError(c, "Invalid arguments");
+        return;
+    }
+
     
-    if (expire != -1) {
+    if (expire != INVALID_EXPIRE) {
         ttl = expire-mstime();
         if (ttl < 0) ttl = 0;
     }
@@ -574,11 +742,26 @@ void pttlCommand(client *c) {
 /* PERSIST key */
 void persistCommand(client *c) {
     if (lookupKeyWrite(c->db,c->argv[1])) {
-        if (removeExpire(c->db,c->argv[1])) {
-            addReply(c,shared.cone);
-            g_pserver->dirty++;
+        if (c->argc == 2) {
+            if (removeExpire(c->db,c->argv[1])) {
+                signalModifiedKey(c,c->db,c->argv[1]);
+                notifyKeyspaceEvent(NOTIFY_GENERIC,"persist",c->argv[1],c->db->id);
+                addReply(c,shared.cone);
+                g_pserver->dirty++;
+            } else {
+                addReply(c,shared.czero);
+            }
+        } else if (c->argc == 3) {
+            if (removeSubkeyExpire(c->db, c->argv[1], c->argv[2])) {
+                signalModifiedKey(c,c->db,c->argv[1]);
+                notifyKeyspaceEvent(NOTIFY_GENERIC,"persist",c->argv[1],c->db->id);
+                addReply(c,shared.cone);
+                g_pserver->dirty++;
+            } else {
+                addReply(c,shared.czero);
+            }
         } else {
-            addReply(c,shared.czero);
+            addReplyError(c, "Invalid arguments");
         }
     } else {
         addReply(c,shared.czero);
@@ -593,3 +776,97 @@ void touchCommand(client *c) {
     addReplyLongLong(c,touched);
 }
 
+expireEntryFat::expireEntryFat(const expireEntryFat &src)
+{
+    m_keyPrimary = sdsdupshared(src.m_keyPrimary);
+    m_vecexpireEntries = src.m_vecexpireEntries;
+    m_dictIndex = nullptr;
+}
+
+expireEntryFat::~expireEntryFat()
+{
+    if (m_dictIndex != nullptr)
+        dictRelease(m_dictIndex);
+}
+
+void expireEntryFat::createIndex()
+{
+    serverAssert(m_dictIndex == nullptr);
+    m_dictIndex = dictCreate(&dbExpiresDictType, nullptr);
+
+    for (auto &entry : m_vecexpireEntries)
+    {
+        if (entry.spsubkey != nullptr)
+        {
+            dictEntry *de = dictAddRaw(m_dictIndex, (void*)entry.spsubkey.get(), nullptr);
+            de->v.s64 = entry.when;
+        }
+    }
+}
+
+void expireEntryFat::expireSubKey(const char *szSubkey, long long when)
+{
+    if (m_vecexpireEntries.size() >= INDEX_THRESHOLD && m_dictIndex == nullptr)
+        createIndex();
+
+    // First check if the subkey already has an expiration
+    if (m_dictIndex != nullptr && szSubkey != nullptr)
+    {
+        dictEntry *de = dictFind(m_dictIndex, szSubkey);
+        if (de != nullptr)
+        {
+            auto itr = std::lower_bound(m_vecexpireEntries.begin(), m_vecexpireEntries.end(), de->v.u64);
+            while (itr != m_vecexpireEntries.end() && itr->when == de->v.s64)
+            {
+                bool fFound = false;
+                if (szSubkey == nullptr && itr->spsubkey == nullptr) {
+                    fFound = true;
+                } else if (szSubkey != nullptr && itr->spsubkey != nullptr && sdscmp((sds)itr->spsubkey.get(), (sds)szSubkey) == 0) {
+                    fFound = true;
+                }
+                if (fFound) {
+                    dictDelete(m_dictIndex, szSubkey);
+                    m_vecexpireEntries.erase(itr);
+                    break;
+                }
+                ++itr;
+            }
+        }
+    }
+    else
+    {
+        for (auto &entry : m_vecexpireEntries)
+        {
+            if (szSubkey != nullptr)
+            {
+                // if this is a subkey expiry then its not a match if the expireEntry is either for the
+                //  primary key or a different subkey
+                if (entry.spsubkey == nullptr || sdscmp((sds)entry.spsubkey.get(), (sds)szSubkey) != 0)
+                    continue;
+            }
+            else
+            {
+                if (entry.spsubkey != nullptr)
+                    continue;
+            }
+            m_vecexpireEntries.erase(m_vecexpireEntries.begin() + (&entry - m_vecexpireEntries.data()));
+            break;
+        }
+    }
+    auto itrInsert = std::lower_bound(m_vecexpireEntries.begin(), m_vecexpireEntries.end(), when);
+    const char *subkey = (szSubkey) ? sdsdup(szSubkey) : nullptr;
+    auto itr = m_vecexpireEntries.emplace(itrInsert, when, subkey);
+    if (m_dictIndex && subkey) {
+        dictEntry *de = dictAddRaw(m_dictIndex, (void*)itr->spsubkey.get(), nullptr);
+        de->v.s64 = when;
+    }
+}
+
+void expireEntryFat::popfrontExpireEntry()
+{ 
+    if (m_dictIndex != nullptr && m_vecexpireEntries.begin()->spsubkey) {
+        int res = dictDelete(m_dictIndex, (void*)m_vecexpireEntries.begin()->spsubkey.get());
+        serverAssert(res == DICT_OK);
+    }
+    m_vecexpireEntries.erase(m_vecexpireEntries.begin());
+}

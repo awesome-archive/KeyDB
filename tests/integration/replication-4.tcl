@@ -1,13 +1,4 @@
-proc start_bg_complex_data {host port db ops} {
-    set tclsh [info nameofexecutable]
-    exec $tclsh tests/helpers/bg_complex_data.tcl $host $port $db $ops &
-}
-
-proc stop_bg_complex_data {handle} {
-    catch {exec /bin/kill -9 $handle}
-}
-
-start_server {tags {"repl"}} {
+start_server {tags {"repl network"}} {
     start_server {} {
 
         set master [srv -1 client]
@@ -25,20 +16,14 @@ start_server {tags {"repl"}} {
             s 0 role
         } {slave}
 
-        test {Test replication with parallel clients writing in differnet DBs} {
+        test {Test replication with parallel clients writing in different DBs} {
             after 5000
             stop_bg_complex_data $load_handle0
             stop_bg_complex_data $load_handle1
             stop_bg_complex_data $load_handle2
-            set retry 10
-            while {$retry && ([$master debug digest] ne [$slave debug digest])}\
-            {
-                after 1000
-                incr retry -1
-            }
-            assert {[$master dbsize] > 0}
-
-            if {[$master debug digest] ne [$slave debug digest]} {
+            wait_for_condition 100 100 {
+                [$master debug digest] == [$slave debug digest]
+            } else {
                 set csv1 [csvdump r]
                 set csv2 [csvdump {r -1}]
                 set fd [open /tmp/repldump1.txt w]
@@ -47,10 +32,9 @@ start_server {tags {"repl"}} {
                 set fd [open /tmp/repldump2.txt w]
                 puts -nonewline $fd $csv2
                 close $fd
-                puts "Master - Replica inconsistency"
-                puts "Run diff -u against /tmp/repldump*.txt for more info"
+                fail "Master - Replica inconsistency, Run diff -u against /tmp/repldump*.txt for more info"
             }
-            assert_equal [r debug digest] [r -1 debug digest]
+            assert {[$master dbsize] > 0}
         }
     }
 }
@@ -88,12 +72,16 @@ start_server {tags {"repl"}} {
             $master config set min-slaves-max-lag 2
             $master config set min-slaves-to-write 1
             assert {[$master set foo bar] eq {OK}}
-            $slave deferred 1
-            $slave debug sleep 6
-            after 4000
-            catch {$master set foo bar} e
-            set e
-        } {NOREPLICAS*}
+            exec kill -SIGSTOP [srv 0 pid]
+            wait_for_condition 100 100 {
+                [catch {$master set foo bar}] != 0
+            } else {
+                fail "Master didn't become readonly"
+            }
+            catch {$master set foo bar} err
+            assert_match {NOREPLICAS*} $err
+            exec kill -SIGCONT [srv 0 pid]
+        }
     }
 }
 
@@ -149,6 +137,94 @@ start_server {tags {"repl"}} {
                 [$master debug digest] eq [$slave debug digest]
             } else {
                 fail "SPOP replication inconsistency"
+            }
+        }
+
+        test {Replication of EXPIREMEMBER (set) command} {
+            $master sadd testkey a b c d
+            wait_for_condition 50 100 {
+                [$master debug digest] eq [$slave debug digest]
+            } else {
+                fail "Failed to replicate set"
+            }
+            $master expiremember testkey a 1
+            after 1000
+            wait_for_condition 50 100 {
+                [$master scard testkey] eq 3
+            } else {
+                fail "expiremember failed to work on master"
+            }
+            wait_for_condition 50 100 {
+                [$slave scard testkey] eq 3
+            } else {
+                assert_equal [$slave scard testkey] 3
+            }
+			$master del testkey
+        }
+
+		test {Replication of EXPIREMEMBER (hash) command} {
+            $master hset testkey a value
+			$master hset testkey b value
+            wait_for_condition 50 100 {
+                [$master debug digest] eq [$slave debug digest]
+            } else {
+                fail "Failed to replicate set"
+            }
+            $master expiremember testkey a 1
+            after 1000
+            wait_for_condition 50 100 {
+                [$master hlen testkey] eq 1
+            } else {
+                fail "expiremember failed to work on master"
+            }
+            wait_for_condition 50 100 {
+                [$slave hlen testkey] eq 1
+            } else {
+                assert_equal [$slave hlen testkey] 1
+            }
+			$master del testkey
+        }
+
+		test {Replication of EXPIREMEMBER (zset) command} {
+            $master zadd testkey 1 a
+			$master zadd testkey 2 b
+            wait_for_condition 50 100 {
+                [$master debug digest] eq [$slave debug digest]
+            } else {
+                fail "Failed to replicate set"
+            }
+            $master expiremember testkey a 1
+            after 1000
+            wait_for_condition 50 100 {
+                [$master zcard testkey] eq 1
+            } else {
+                fail "expiremember failed to work on master"
+            }
+            wait_for_condition 50 100 {
+                [$slave zcard testkey] eq 1
+            } else {
+                assert_equal [$slave zcard testkey] 1
+            }
+        }
+
+		test {keydb.cron replicates} {
+            $master del testkey
+            $master keydb.cron testjob repeat 0 1000000 {redis.call("incr", "testkey")} 1 testkey
+            after 300
+            assert_equal 1 [$master get testkey]
+            assert_equal 1 [$master exists testjob]
+
+            wait_for_condition 50 100 {
+                [$master debug digest] eq [$slave debug digest]
+            } else {
+                fail "KEYDB.CRON failed to replicate"
+            }
+            $master del testjob
+            $master del testkey
+            wait_for_condition 50 1000 {
+                [$master debug digest] eq [$slave debug digest]
+            } else {
+                fail "cron delete failed to propogate"
             }
         }
     }
